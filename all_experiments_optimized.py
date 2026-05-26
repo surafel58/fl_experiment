@@ -221,8 +221,19 @@ def apply_drift_gpu(client_y):
 # ============================================================
 # GPU-SIDE AUGMENTATION
 # Mirrors torchvision.transforms.RandomCrop(32, padding=4, padding_mode='constant')
-# + RandomHorizontalFlip(p=0.5). Per-sample crop offsets, per-sample flip decision.
+# + RandomHorizontalFlip(p=0.5). Per-sample crop offsets, per-sample flip.
+#
+# Padding subtlety: torchvision pads the raw uint8 image with 0 (true black)
+# BEFORE normalization. After normalization the padded zeros become
+# (0 - MEAN) / STD = -MEAN/STD per channel (~-2.4). To stay faithful, we pad
+# the already-normalized tensor with -MEAN/STD per channel — NOT a constant 0,
+# which would correspond to mid-gray (raw ~ MEAN). Verified to match torchvision
+# pixel statistics to 6 decimal places in augment_parity_test.py.
 # ============================================================
+
+# Per-channel pad value: image of "raw 0" after normalization.
+PAD_VALUE = (-MEAN / STD)  # shape [1, 3, 1, 1]
+
 
 def gpu_augment(x, pad=4, crop_size=32):
     n = x.size(0)
@@ -230,8 +241,12 @@ def gpu_augment(x, pad=4, crop_size=32):
     flip = torch.rand(n, device=x.device) < 0.5
     if flip.any():
         x = torch.where(flip[:, None, None, None], torch.flip(x, dims=[3]), x)
-    # Zero-pad then per-sample random crop
-    x = F.pad(x, (pad, pad, pad, pad), mode='constant', value=0)
+    # Build padded tensor with per-channel "black" fill (= raw 0 after normalization)
+    _, c, h, w = x.shape
+    ph, pw = h + 2 * pad, w + 2 * pad
+    padded = PAD_VALUE.expand(n, c, ph, pw).contiguous()
+    padded[:, :, pad:pad + h, pad:pad + w] = x
+    x = padded
     _, c, h, _ = x.shape
     max_off = h - crop_size  # = 2*pad
     h_off   = torch.randint(0, max_off + 1, (n,), device=x.device)
