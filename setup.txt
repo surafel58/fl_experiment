@@ -1,0 +1,160 @@
+# ============================================================
+# Full Setup Guide — Windows + RTX 4050
+# Drift-Triggered Selective Layer Adaptation Experiment
+# ============================================================
+
+# ============================================================
+# STEP 1 — Install Python (if not already installed)
+# ============================================================
+#
+# 1. Go to https://www.python.org/downloads/
+# 2. Download Python 3.11.x (NOT 3.12 — PyTorch has issues with 3.12)
+# 3. During installation:
+#    - CHECK "Add Python to PATH"
+#    - CHECK "Install for all users"
+# 4. Verify installation — open Command Prompt and type:
+#      python --version
+#    Should print: Python 3.11.x
+
+
+# ============================================================
+# STEP 2 — Create a virtual environment
+# ============================================================
+#
+# Open Command Prompt (Win + R, type cmd, press Enter)
+# Navigate to where you want to put the project:
+
+cd C:\Users\YourName\Desktop
+mkdir fl_experiment
+cd fl_experiment
+
+# Create virtual environment:
+python -m venv venv
+
+# Activate it:
+venv\Scripts\activate
+
+# You should now see (venv) at the start of your command line.
+# Every command below assumes the venv is activated.
+
+
+# ============================================================
+# STEP 3 — Install PyTorch with CUDA 12.1 (for RTX 4050)
+# ============================================================
+#
+# RTX 4050 supports CUDA 12.x. Install PyTorch with CUDA 12.1:
+
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+# This will download ~2.5GB. Takes a few minutes.
+# Verify CUDA is detected after install:
+
+python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0))"
+
+# Should print:
+#   CUDA available: True
+#   GPU: NVIDIA GeForce RTX 4050 Laptop GPU (or similar)
+#
+# If it prints CUDA available: False, your CUDA drivers need updating.
+# Download the latest NVIDIA driver from https://www.nvidia.com/drivers
+
+
+# ============================================================
+# STEP 4 — Install other dependencies
+# ============================================================
+
+pip install numpy matplotlib
+
+# That is all. No other dependencies needed.
+
+
+# ============================================================
+# STEP 5 — Copy the experiment file
+# ============================================================
+#
+# Copy drift_fl_experiment.py into your fl_experiment folder.
+# Your folder structure should look like:
+#
+# fl_experiment/
+#   venv/
+#   drift_fl_experiment.py
+#
+# The script will automatically create a ./data folder and
+# download CIFAR-10 (~170MB) on first run.
+
+
+# ============================================================
+# STEP 6 — Run the experiment
+# ============================================================
+#
+# Make sure your venv is activated (you see (venv) in terminal)
+# Then run:
+
+python drift_fl_experiment.py
+
+# Expected output:
+#   Using device: cuda
+#   Signal: EMA per-layer gradient magnitude
+#   ...
+#   (training rounds)
+#   ...
+#   EMA DIAGNOSTICS — Client 0 (drifting, Group A)
+#   (table of g_l, ema_l, ratio values)
+#   ...
+#   RESULTS SUMMARY
+#   ...
+#   Plot saved as drift_fl_results.png
+#
+# Expected runtime on RTX 4050: 8-12 minutes
+
+
+# ============================================================
+# STEP 7 — Find your results
+# ============================================================
+#
+# After the run completes:
+#   - Results summary printed in terminal
+#   - drift_fl_results.png saved in fl_experiment/
+#   - EMA diagnostic table printed in terminal
+#
+# IMPORTANT: Copy the full terminal output and share it.
+# The diagnostic table is what matters most for tuning TAU.
+
+
+# ============================================================
+# TROUBLESHOOTING
+# ============================================================
+#
+# Problem: "python is not recognized"
+# Fix: Re-run Python installer, make sure "Add to PATH" is checked
+#
+# Problem: CUDA not available after install
+# Fix: Update NVIDIA drivers from https://www.nvidia.com/drivers
+#      Then reinstall PyTorch
+#
+# Problem: "No module named torch"
+# Fix: Make sure venv is activated (you see (venv) in terminal)
+#      Then rerun: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+# Problem: Out of memory error
+# Fix: Reduce BATCH_SIZE from 64 to 32 in drift_fl_experiment.py
+#
+# Problem: Download fails for CIFAR-10
+# Fix: Run once with internet, data saves to ./data/ for all future runs
+
+
+# ============================================================
+# QUICK REFERENCE — All commands in order
+# ============================================================
+
+# Open Command Prompt, then:
+
+cd C:\Users\YourName\Desktop
+mkdir fl_experiment
+cd fl_experiment
+python -m venv venv
+venv\Scripts\activate
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install numpy matplotlib
+# copy drift_fl_experiment.py into fl_experiment folder
+python drift_fl_experiment.py
