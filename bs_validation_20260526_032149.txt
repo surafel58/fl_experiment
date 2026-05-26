@@ -1,0 +1,12 @@
+BS validation @ 20260526_032149  device=cuda
+  rounds=40  clients=20  local_epochs=5
+
+config                   final acc   mean last 5    wall (s)
+------------------------------------------------------------
+X1_bs64                     0.6606        0.6601       396.5
+X2_bs128_lr01               0.6445        0.6426       210.4
+X3_bs128_lrsq2              0.6516        0.6488       209.6
+
+Deltas vs X1_bs64 (last-5 mean):
+  X2_bs128_lr01          -0.0175  (PASS at 2% threshold)
+  X3_bs128_lrsq2         -0.0113  (PASS at 2% threshold)
