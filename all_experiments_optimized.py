@@ -1033,6 +1033,9 @@ def parse_args():
                 "  python3 all_experiments_optimized.py --methods all\n"))
     p.add_argument('--methods', nargs='+', default=['all'],
                    help="Method IDs (1..4) or 'all' (default).")
+    p.add_argument('--rounds', type=int, default=None,
+                   help=f"Override total rounds (default {NUM_ROUNDS}). "
+                        f"For smoke tests, use a small value like 10.")
     return p.parse_args()
 
 
@@ -1074,8 +1077,15 @@ if __name__ == '__main__':
     method_ids  = resolve_methods(args.methods)
     method_names = [METHOD_REGISTRY[m][0] for m in method_ids]
 
+    if args.rounds is not None:
+        if args.rounds < 1:
+            raise SystemExit("--rounds must be >= 1")
+        NUM_ROUNDS = args.rounds
+        print(f"\n[--rounds override] NUM_ROUNDS={NUM_ROUNDS}")
+
     print("\n" + "="*60)
     print(f"RUNNING METHODS: {' -> '.join(method_names)}")
+    print(f"Rounds per method: {NUM_ROUNDS}")
     print("="*60)
 
     logs = {}
