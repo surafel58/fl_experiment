@@ -1,0 +1,42 @@
+====================================================================================================
+Q3 — OurMethod drift-window global acc recap (with hybrid version of code)
+====================================================================================================
+  Seed         pre       min   mean(100-115)  stable(190-199)
+  ------------------------------------------------------------
+  0         0.7081    0.5836          0.6067           0.5884
+  1         0.7119    0.6146          0.6244           0.6170
+  2         0.7184    0.5796          0.5935           0.5775
+  mean      0.7128    0.5926          0.6082           0.5943
+  std       0.0052    0.0192          0.0155           0.0204
+
+====================================================================================================
+Q1 — HYBRID vs GLOBAL on flagged clients (OurMethod internal)
+====================================================================================================
+  For each (seed, round in 100..115), for the clients flagged
+  in THAT round, compute: mean(hybrid_cXX) - mean(local_cXX)
+  Positive = the hybrid (what clients use) beats the global (what we logged before).
+
+  Seed        Mean hyb-lift on flagged (per round, mean over window)
+  --------------------------------------------------------------------
+  0                                                 0.3454  (13 flagged rounds in window)
+  1                                                 0.3277  (13 flagged rounds in window)
+  2                                                 0.4255  (7 flagged rounds in window)
+
+  Across all seeds:
+    Mean hyb-lift per flagged round = +0.3554
+    Max hyb-lift seen              = +0.5997
+    Min hyb-lift seen              = +0.0744
+    N (flagged rounds total)        = 33
+
+====================================================================================================
+Q2 — OurMethod HYBRID vs FedAvg LOCAL on same flagged clients (seeds 1, 2)
+====================================================================================================
+  For each seed in {1, 2}, for each round in 100..115 when any
+  client was flagged: compare OurMethod's hybrid_cXX (what the client
+  actually uses) vs FedAvg's local_cXX (what FedAvg gives the client).
+
+  Seed     Mean hybrid   Mean FedAvg         Δ   #rounds
+  ------------------------------------------------------
+  1             0.7610        0.4385   +0.3225        13
+  2             0.8580        0.4602   +0.3978         7
+

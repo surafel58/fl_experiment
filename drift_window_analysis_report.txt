@@ -1,0 +1,65 @@
+====================================================================================================
+METRIC 1-4: GLOBAL ACCURACY DURING DRIFT WINDOW
+====================================================================================================
+  Drift round: 100 | Flag window end: ~115 | Recovery end: 130
+
+  Method                pre-drift   min (100-115)   mean (100-115)   auc (100-130)   rounds to 95%
+  ----------------------------------------------------------------------------------------------
+  FedAvg            0.7128+/-0.005  0.5912+/-0.018   0.6052+/-0.016  0.6011+/-0.017100.0000+/-0.000
+  Flash             0.6912+/-0.006  0.5047+/-0.029   0.5665+/-0.018  0.5801+/-0.018  0.0000+/-0.000
+  AdaptiveFedAvg    0.5772+/-0.019  0.5133+/-0.027   0.5275+/-0.025  0.5184+/-0.02533.3333+/-57.735
+  OurMethod         0.7221+/-0.011  0.5975+/-0.025   0.6155+/-0.023  0.6118+/-0.025100.0000+/-0.000
+
+  PAIRWISE DELTAS (OurMethod - baseline, mean over seeds):
+  vs                     pre Δ     min Δ    mean Δ     auc Δ     t95 Δ
+  --------------------------------------------------------------------
+  vs FedAvg            +0.0093   +0.0063   +0.0102   +0.0107      +0.0
+  vs Flash             +0.0309   +0.0928   +0.0490   +0.0317      +0.0
+  vs AdaptiveFedAvg    +0.1449   +0.0842   +0.0880   +0.0934      +0.0
+
+  Reading: for pre/min/mean/auc, POSITIVE delta = OurMethod better.
+           for t95 (rounds to recover), NEGATIVE delta = OurMethod faster.
+
+====================================================================================================
+METRIC 5: PER-FLAGGED-CLIENT LOCAL ACC DURING FLAG WINDOW (seeds 1+2)
+====================================================================================================
+  Window: rounds 100-115 inclusive
+  Compares OurMethod adaptation vs FedAvg passive averaging for the
+  same clients that OurMethod flagged.
+
+  Seed 1 flagged-ever clients: [3, 4, 5, 9, 13, 14]  (6 clients)
+  Seed 2 flagged-ever clients: [0, 1, 2, 3, 9, 10, 14, 18]  (8 clients)
+
+  Method        Seed        Flagged clients win-mean local acc
+  ------------------------------------------------------------
+  FedAvg        1                                       0.3718
+  FedAvg        2                                       0.4424
+  Flash         1                                       0.3733
+  Flash         2                                       0.4423
+  AdaptiveFedAvg1                                       0.2698
+  AdaptiveFedAvg2                                       0.3557
+  OurMethod     1                                       0.3564
+  OurMethod     2                                       0.4238
+
+  PAIRWISE DELTA on flagged clients' local acc (OurMethod - FedAvg):
+  seed=1  FedAvg=0.3718  OurMethod=0.3564  delta=-0.0154
+  seed=2  FedAvg=0.4424  OurMethod=0.4238  delta=-0.0185
+  MEAN delta: -0.0170 (-1.70pp)
+
+====================================================================================================
+METRIC 6: PER-DRIFT-GROUP LOCAL ACC DURING FLAG WINDOW (seeds 1+2)
+====================================================================================================
+  Window: rounds 100-115 inclusive
+
+  Method                Group A win-mean    Group B win-mean    Group C win-mean
+  ------------------------------------------------------------------------------
+  FedAvg                          0.5887              0.4917              0.6756
+  Flash                           0.5608              0.4687              0.6649
+  AdaptiveFedAvg                  0.4921              0.3528              0.5546
+  OurMethod                       0.5788              0.4856              0.6931
+
+  PAIRWISE DELTAS OurMethod - FedAvg per group (in pp):
+  Group A (1<->2): -0.98pp
+  Group B (3<->4): -0.61pp
+  Group C (5<->6): +1.75pp
+

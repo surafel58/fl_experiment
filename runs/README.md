@@ -14,6 +14,7 @@ intent; seed subdirectories group per-seed CSV outputs.
 | [2026-05-26-bug-all4](2026-05-26-bug-all4/) | 2026-05-26 | FedAvg, Flash, AdaptiveFedAvg | 0 | GPU-resident pipeline, **buggy mid-gray pad** | Companion all-3 run to complete the first 4-method comparison. CSVs overwritten; only the log survives. Misleadingly favored FedAvg — that bug led to the parity test that found the pad value mismatch. |
 | [2026-05-26-augfix](2026-05-26-augfix/) | 2026-05-26 | all 4 | 0 | **Augment pad fix applied** (true black, matches torchvision) | First clean 4-method seed=0 run. No per-client logging yet. |
 | [2026-05-27-multiseed](2026-05-27-multiseed/) | 2026-05-27 | all 4 | 1, 2 | Augment fix + **per-client local-accuracy logging** + `--seed` flag | Two additional seeds for mean±std. Per-client CSV columns `local_c00..local_c19`. |
+| [2026-05-28-hybrid](2026-05-28-hybrid/) | 2026-05-28 | OurMethod only | 0, 1, 2 | Adds **hybrid-model logging** (what the client actually uses) | Decisive run for the adaptation claim: ~+35pp mean hyb-lift across 3 seeds, ~+32–40pp vs FedAvg on flagged clients during flag window. |
 
 ## Conventions
 
