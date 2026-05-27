@@ -303,6 +303,42 @@ def evaluate_gpu(model, test_x=None, test_y=None, batch=512):
     return correct / total
 
 
+def local_evaluate_gpu(model, x, y, batch=1024):
+    """
+    Accuracy of the GLOBAL model on a single client's local data
+    (with whatever labels they currently hold — may be drifted).
+    Measures whether the federated model serves this client well.
+    """
+    model.eval()
+    correct = 0
+    n = x.size(0)
+    with torch.no_grad():
+        for s in range(0, n, batch):
+            out = model(x[s:s+batch])
+            correct += (out.argmax(1) == y[s:s+batch]).sum().item()
+    return correct / n if n > 0 else 0.0
+
+
+def evaluate_all_clients(model, client_y):
+    """Return [acc_0, acc_1, ..., acc_{N-1}] of the global model on each client's data."""
+    return [local_evaluate_gpu(model, GPU_CLIENT_X[cid], client_y[cid])
+            for cid in range(NUM_CLIENTS)]
+
+
+# Column names for per-client local accuracy (used by all methods)
+CLIENT_FIELDS = [f'local_c{cid:02d}' for cid in range(NUM_CLIENTS)]
+
+
+def build_local_row(rnd, global_acc, local_accs, extra=None):
+    """Build a CSV row dict with round, global_acc, optional extras, and per-client local accs."""
+    row = {'round': rnd, 'global_acc': global_acc}
+    if extra:
+        row.update(extra)
+    for cid, a in enumerate(local_accs):
+        row[f'local_c{cid:02d}'] = a
+    return row
+
+
 def local_train_gpu(model, x, y, epochs=LOCAL_EPOCHS, lr=LR, batch_size=BATCH_SIZE):
     """
     SGD on one client's GPU-resident data with GPU augmentation.
@@ -334,6 +370,16 @@ def fedavg_aggregate(global_model, local_states, weights):
     global_model.load_state_dict(new)
 
 
+def seeded_path(base_name):
+    """results_X.csv stays as-is for seed 0 (backward compat); becomes
+    results_X_seed1.csv etc. for other seeds. Lets multi-seed runs coexist."""
+    if SEED == 0:
+        return base_name
+    if base_name.endswith('.csv'):
+        return base_name[:-4] + f'_seed{SEED}.csv'
+    return base_name + f'_seed{SEED}'
+
+
 class LiveCSV:
     """Append-as-you-go CSV that flushes on every write."""
     def __init__(self, path, fieldnames):
@@ -363,7 +409,8 @@ def run_fedavg():
     client_y = fresh_client_y()
     gm       = get_model()
     log      = []
-    csv_out  = LiveCSV('results_FedAvg.csv', ['round', 'global_acc'])
+    csv_out  = LiveCSV(seeded_path('results_FedAvg.csv'),
+                       ['round', 'global_acc'] + CLIENT_FIELDS)
 
     try:
         for rnd in range(NUM_ROUNDS):
@@ -379,14 +426,17 @@ def run_fedavg():
                 weights.append(CLIENT_WEIGHTS[cid])
 
             fedavg_aggregate(gm, states, weights)
-            acc = evaluate_gpu(gm)
-            row = {'round': rnd, 'global_acc': acc}
+            acc        = evaluate_gpu(gm)
+            local_accs = evaluate_all_clients(gm, client_y)
+            row        = build_local_row(rnd, acc, local_accs)
             log.append(row)
             csv_out.write(row)
 
             if rnd % 10 == 0 or rnd == DRIFT_ROUND:
                 tag = "  <-- DRIFT" if rnd == DRIFT_ROUND else ""
-                print(f"  Round {rnd:03d} | Global: {acc:.4f}{tag}")
+                mean_local = sum(local_accs) / len(local_accs)
+                print(f"  Round {rnd:03d} | Global: {acc:.4f} | "
+                      f"mean local: {mean_local:.4f}{tag}")
     finally:
         csv_out.close()
     print(f"  Results: {csv_out.path}")
@@ -412,7 +462,8 @@ def run_flash():
     client_y = fresh_client_y()
     gm       = get_model()
     log      = []
-    csv_out  = LiveCSV('results_Flash.csv', ['round', 'global_acc'])
+    csv_out  = LiveCSV(seeded_path('results_Flash.csv'),
+                       ['round', 'global_acc'] + CLIENT_FIELDS)
     crit     = nn.CrossEntropyLoss()
 
     first_mom  = 0
@@ -492,14 +543,17 @@ def run_flash():
                 agg_update, dtype=torch.float32).to(DEVICE)
             vector_to_parameters(new_global, gm.parameters())
 
-            acc = evaluate_gpu(gm)
-            row = {'round': rnd, 'global_acc': acc}
+            acc        = evaluate_gpu(gm)
+            local_accs = evaluate_all_clients(gm, client_y)
+            row        = build_local_row(rnd, acc, local_accs)
             log.append(row)
             csv_out.write(row)
 
             if rnd % 10 == 0 or rnd == DRIFT_ROUND:
                 tag = "  <-- DRIFT" if rnd == DRIFT_ROUND else ""
-                print(f"  Round {rnd:03d} | Global: {acc:.4f}{tag}")
+                mean_local = sum(local_accs) / len(local_accs)
+                print(f"  Round {rnd:03d} | Global: {acc:.4f} | "
+                      f"mean local: {mean_local:.4f}{tag}")
     finally:
         csv_out.close()
     print(f"  Results: {csv_out.path}")
@@ -527,8 +581,8 @@ def run_adaptive_fedavg():
     client_y = fresh_client_y()
     gm       = get_model()
     log      = []
-    csv_out  = LiveCSV('results_AdaptiveFedAvg.csv',
-                       ['round', 'global_acc', 'client_lr'])
+    csv_out  = LiveCSV(seeded_path('results_AdaptiveFedAvg.csv'),
+                       ['round', 'global_acc', 'client_lr'] + CLIENT_FIELDS)
 
     # Server-side adaptive-LR state
     prev_mean          = 0.0
@@ -583,15 +637,19 @@ def run_adaptive_fedavg():
             current_lr = float(min(client_init_lr,
                                    client_init_lr * ratio_norm / cur_round))
 
-            acc = evaluate_gpu(gm)
-            row = {'round': rnd, 'global_acc': acc, 'client_lr': current_lr}
+            acc        = evaluate_gpu(gm)
+            local_accs = evaluate_all_clients(gm, client_y)
+            row        = build_local_row(rnd, acc, local_accs,
+                                         extra={'client_lr': current_lr})
             log.append(row)
             csv_out.write(row)
 
             if rnd % 10 == 0 or rnd == DRIFT_ROUND:
                 tag = "  <-- DRIFT" if rnd == DRIFT_ROUND else ""
+                mean_local = sum(local_accs) / len(local_accs)
                 print(f"  Round {rnd:03d} | Global: {acc:.4f} | "
-                      f"client_lr={current_lr:.5f}{tag}")
+                      f"mean local: {mean_local:.4f} | "
+                      f"lr={current_lr:.5f}{tag}")
     finally:
         csv_out.close()
     print(f"  Results: {csv_out.path}")
@@ -738,8 +796,9 @@ def run_our_method():
     clients  = [OurClient(i) for i in range(NUM_CLIENTS)]
     log      = []
 
-    csv_out  = LiveCSV('results_OurMethod.csv', ['round', 'global_acc'])
-    flag_csv = LiveCSV('results_OurMethod_flags.csv', [
+    csv_out  = LiveCSV(seeded_path('results_OurMethod.csv'),
+                       ['round', 'global_acc'] + CLIENT_FIELDS)
+    flag_csv = LiveCSV(seeded_path('results_OurMethod_flags.csv'), [
         'round', 'flagged_count',
         'flagged_layer3_count', 'flagged_layer4_count',
         'flagged_client_ids', 'flagged_layer3_ids',
@@ -757,9 +816,11 @@ def run_our_method():
             weights = [CLIENT_WEIGHTS[c.cid] for c in clients]
             per_layer_fedavg_our(gm, clients, weights)
 
-            acc = evaluate_gpu(gm)
-            log.append({'round': rnd, 'global_acc': acc})
-            csv_out.write({'round': rnd, 'global_acc': acc})
+            acc        = evaluate_gpu(gm)
+            local_accs = evaluate_all_clients(gm, client_y)
+            row        = build_local_row(rnd, acc, local_accs)
+            log.append(row)
+            csv_out.write(row)
 
             flagged_layer3 = [c.cid for c in clients if c.prev_flags.get('layer3', False)]
             flagged_layer4 = [c.cid for c in clients if c.prev_flags.get('layer4', False)]
@@ -1051,6 +1112,10 @@ def parse_args():
     p.add_argument('--rounds', type=int, default=None,
                    help=f"Override total rounds (default {NUM_ROUNDS}). "
                         f"For smoke tests, use a small value like 10.")
+    p.add_argument('--seed', type=int, default=None,
+                   help=f"Random seed (default {SEED}). Drives partition + "
+                        f"init. For seed != 0, output CSVs are named "
+                        f"results_X_seed<N>.csv so multi-seed runs coexist.")
     return p.parse_args()
 
 
@@ -1097,6 +1162,30 @@ if __name__ == '__main__':
             raise SystemExit("--rounds must be >= 1")
         NUM_ROUNDS = args.rounds
         print(f"\n[--rounds override] NUM_ROUNDS={NUM_ROUNDS}")
+
+    if args.seed is not None and args.seed != SEED:
+        print(f"\n[--seed override] re-seeding to {args.seed} and re-partitioning...")
+        SEED = args.seed
+        torch.manual_seed(SEED)
+        np.random.seed(SEED)
+        random.seed(SEED)
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+        # Re-partition with the new seed
+        train_idx = partition_dataset(raw_train, NUM_CLIENTS, ALPHA_DIR, SEED)
+        # Rebuild GPU-resident tensors (x is also re-built since partition changed)
+        GPU_CLIENT_X.clear()
+        GPU_CLIENT_Y_CLEAN.clear()
+        for _cid in range(NUM_CLIENTS):
+            _x, _y = _to_gpu_tensors(raw_train, train_idx[_cid])
+            GPU_CLIENT_X[_cid]       = _x
+            GPU_CLIENT_Y_CLEAN[_cid] = _y
+        # CLIENT_WEIGHTS is module-level; mutate in place
+        for _i in range(NUM_CLIENTS):
+            CLIENT_WEIGHTS[_i] = GPU_CLIENT_X[_i].size(0)
+        sizes = [GPU_CLIENT_X[i].size(0) for i in range(NUM_CLIENTS)]
+        print(f"  Re-partitioned: samples/client min={min(sizes)} "
+              f"max={max(sizes)} mean={int(np.mean(sizes))}")
 
     print("\n" + "="*60)
     print(f"RUNNING METHODS: {' -> '.join(method_names)}")
