@@ -327,6 +327,8 @@ def evaluate_all_clients(model, client_y):
 
 # Column names for per-client local accuracy (used by all methods)
 CLIENT_FIELDS = [f'local_c{cid:02d}' for cid in range(NUM_CLIENTS)]
+# Column names for per-client HYBRID accuracy (OurMethod only — see run_our_method)
+HYBRID_FIELDS = [f'hybrid_c{cid:02d}' for cid in range(NUM_CLIENTS)]
 
 
 def build_local_row(rnd, global_acc, local_accs, extra=None):
@@ -767,6 +769,43 @@ class OurClient:
         return out
 
 
+def compute_hybrid_state(client, global_state):
+    """
+    Build the state_dict the client would use AFTER selective_sync next round —
+    i.e. global model for unflagged layers + classifier, client's local_state
+    for flagged layers. Pure function, no side effects on client.model.
+    """
+    state = {k: v.clone() for k, v in global_state.items()}
+    if client.local_state is not None:
+        for name, prefix in LAYER_GROUPS.items():
+            if client.prev_flags.get(name, False):
+                for key in state:
+                    if key.startswith(prefix):
+                        state[key] = client.local_state[key].clone()
+    # Classifier always taken from global (the design pins shared label semantics)
+    for key in state:
+        if key.startswith(CLASSIFIER):
+            state[key] = global_state[key].clone()
+    return state
+
+
+def evaluate_all_clients_hybrid(global_model, clients, client_y, temp_model):
+    """
+    Per-client accuracy of the HYBRID model (what the client actually uses
+    next round) on the client's own data. For OurMethod the hybrid differs
+    from the global model exactly when c.prev_flags has any True entries.
+    """
+    global_state = global_model.state_dict()
+    accs = []
+    for c in clients:
+        h_state = compute_hybrid_state(c, global_state)
+        temp_model.load_state_dict(h_state)
+        accs.append(local_evaluate_gpu(temp_model,
+                                       GPU_CLIENT_X[c.cid],
+                                       client_y[c.cid]))
+    return accs
+
+
 def per_layer_fedavg_our(global_model, clients, weights):
     gs  = global_model.state_dict()
     new = {k: v.clone() for k, v in gs.items()}
@@ -803,13 +842,14 @@ def run_our_method():
     print(f"  EMA alpha={EMA_ALPHA} | TAU={TAU_OUR} | Warmup={WARMUP}")
     print("="*60)
 
-    client_y = fresh_client_y()
-    gm       = get_model()
-    clients  = [OurClient(i) for i in range(NUM_CLIENTS)]
-    log      = []
+    client_y    = fresh_client_y()
+    gm          = get_model()
+    clients     = [OurClient(i) for i in range(NUM_CLIENTS)]
+    hybrid_temp = get_model()   # reused buffer for hybrid-model evaluation
+    log         = []
 
     csv_out  = LiveCSV(seeded_path('results_OurMethod.csv'),
-                       ['round', 'global_acc'] + CLIENT_FIELDS)
+                       ['round', 'global_acc'] + CLIENT_FIELDS + HYBRID_FIELDS)
     flag_csv = LiveCSV(seeded_path('results_OurMethod_flags.csv'), [
         'round', 'flagged_count',
         'flagged_layer3_count', 'flagged_layer4_count',
@@ -830,7 +870,13 @@ def run_our_method():
 
             acc        = evaluate_gpu(gm)
             local_accs = evaluate_all_clients(gm, client_y)
-            row        = build_local_row(rnd, acc, local_accs)
+            # HYBRID: per-client accuracy of the model each client actually uses
+            # next round (global for unflagged layers + classifier, local for flagged).
+            hybrid_accs = evaluate_all_clients_hybrid(gm, clients, client_y, hybrid_temp)
+
+            row = build_local_row(rnd, acc, local_accs)
+            for cid, h in enumerate(hybrid_accs):
+                row[f'hybrid_c{cid:02d}'] = h
             log.append(row)
             csv_out.write(row)
 
@@ -851,10 +897,18 @@ def run_our_method():
             if (rnd % 10 == 0 or rnd == DRIFT_ROUND or
                     DRIFT_ROUND <= rnd <= DRIFT_ROUND + 20):
                 tag = "  <-- DRIFT" if rnd == DRIFT_ROUND else ""
+                # Hybrid lift on flagged clients (the metric the thesis cares about)
+                if flagged_any:
+                    fh = [hybrid_accs[c] for c in flagged_any]
+                    fl = [local_accs[c]  for c in flagged_any]
+                    delta = sum(fh)/len(fh) - sum(fl)/len(fl)
+                    hyb_str = f" | hyb-lift(flagged): {delta:+.4f}"
+                else:
+                    hyb_str = ""
                 print(f"  Round {rnd:03d} | Global: {acc:.4f} | "
                       f"Flagged: {len(flagged_any)}/{NUM_CLIENTS} "
                       f"(L3:{len(flagged_layer3)}, L4:{len(flagged_layer4)}) "
-                      f"IDs: {flagged_any}{tag}")
+                      f"IDs: {flagged_any}{hyb_str}{tag}")
     finally:
         csv_out.close()
         flag_csv.close()
