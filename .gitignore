@@ -19,8 +19,9 @@ __pycache__/
 # Logs and run artifacts
 experiment_log_*.txt
 nohup.out
-runs/
 log/
+# runs/ is intentionally NOT ignored — that's where committed
+# per-run CSV results + run logs + RUN_NOTES.md live.
 
 # OS
 .DS_Store

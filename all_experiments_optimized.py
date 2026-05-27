@@ -370,9 +370,21 @@ def fedavg_aggregate(global_model, local_states, weights):
     global_model.load_state_dict(new)
 
 
+OUT_DIR = ''   # Empty = current directory; overridden by --out-dir
+
+
 def seeded_path(base_name):
-    """results_X.csv stays as-is for seed 0 (backward compat); becomes
-    results_X_seed1.csv etc. for other seeds. Lets multi-seed runs coexist."""
+    """Resolve the output path for a CSV.
+
+    Rules:
+      - If OUT_DIR is set (--out-dir), write into OUT_DIR with the bare
+        base name (no _seed<N> suffix — the folder encodes the seed).
+      - Otherwise (no --out-dir): seed=0 uses the bare base_name (back-compat),
+        non-zero seeds get a `_seed<N>` filename suffix.
+    """
+    if OUT_DIR:
+        os.makedirs(OUT_DIR, exist_ok=True)
+        return os.path.join(OUT_DIR, base_name)
     if SEED == 0:
         return base_name
     if base_name.endswith('.csv'):
@@ -1116,6 +1128,11 @@ def parse_args():
                    help=f"Random seed (default {SEED}). Drives partition + "
                         f"init. For seed != 0, output CSVs are named "
                         f"results_X_seed<N>.csv so multi-seed runs coexist.")
+    p.add_argument('--out-dir', type=str, default=None,
+                   help="Directory to write result CSVs into. If set, the "
+                        "_seed<N> filename suffix is dropped (the folder "
+                        "encodes the seed). Use this to land results "
+                        "straight into a runs/<tag>/seed<N>/ folder.")
     return p.parse_args()
 
 
@@ -1162,6 +1179,11 @@ if __name__ == '__main__':
             raise SystemExit("--rounds must be >= 1")
         NUM_ROUNDS = args.rounds
         print(f"\n[--rounds override] NUM_ROUNDS={NUM_ROUNDS}")
+
+    if args.out_dir is not None:
+        OUT_DIR = args.out_dir
+        os.makedirs(OUT_DIR, exist_ok=True)
+        print(f"[--out-dir] CSVs will be written to: {OUT_DIR}/")
 
     if args.seed is not None and args.seed != SEED:
         print(f"\n[--seed override] re-seeding to {args.seed} and re-partitioning...")

@@ -1,0 +1,73 @@
+====================================================================================================
+STEP 1: PER-CLIENT LOCAL ACCURACY (seeds 1 + 2)
+====================================================================================================
+
+>> Per-DRIFT-GROUP mean accuracy (seeds 1+2 averaged):
+
+  Method              Group A (1<->2)         Group B (3<->4)         Group C (5<->6)       
+                      pre / drift / stable    pre / drift / stable    pre / drift / stable  
+  --------------------------------------------------------------------------------------------
+  FedAvg              0.720/0.604/0.610       0.648/0.487/0.507       0.777/0.630/0.689     
+  Flash               0.705/0.617/0.614       0.614/0.473/0.504       0.758/0.650/0.685     
+  AdaptiveFedAvg      0.567/0.527/0.459       0.434/0.350/0.398       0.638/0.537/0.598     
+  OurMethod           0.730/0.571/0.617       0.650/0.465/0.507       0.778/0.690/0.682     
+
+>> Per-client POST-DRIFT STABLE acc: OurMethod minus FedAvg
+   (positive = OurMethod recovers this client BETTER post-drift)
+
+  Client  Group         FedAvg   OurMethod       Delta
+  ----------------------------------------------------
+  0       A             0.5510      0.5786     +0.0276  <-- OurMethod wins
+  1       A             0.5054      0.5177     +0.0123  <-- OurMethod wins
+  2       A             0.5013      0.4979     -0.0033
+  3       B             0.4068      0.4068     +0.0000
+  4       B             0.5936      0.5814     -0.0122  <-- FedAvg wins
+  5       B             0.2957      0.3064     +0.0107  <-- OurMethod wins
+  6       C             0.8608      0.8600     -0.0008
+  7       C             0.4518      0.4658     +0.0140  <-- OurMethod wins
+  8       C             0.8867      0.8891     +0.0023
+  9       C             0.4388      0.4244     -0.0145  <-- FedAvg wins
+  10      A             0.5845      0.5955     +0.0110  <-- OurMethod wins
+  11      A             0.7170      0.7078     -0.0092
+  12      A             0.8038      0.8042     +0.0004
+  13      B             0.5191      0.5049     -0.0142  <-- FedAvg wins
+  14      B             0.4202      0.4300     +0.0098
+  15      B             0.8088      0.8107     +0.0019
+  16      C             0.6419      0.6441     +0.0022
+  17      C             0.7939      0.7748     -0.0191  <-- FedAvg wins
+  18      C             0.6601      0.6249     -0.0352  <-- FedAvg wins
+  19      C             0.7792      0.7743     -0.0049
+
+  Summary: OurMethod wins 5 clients, FedAvg wins 5, ties (|Δ|<0.01) = 10
+  Mean per-client delta: -0.0011 (-0.11pp)
+
+>> Flagged-vs-unflagged: did OurMethod help the clients it flagged?
+   Flagged-ever (seed 1): [3, 4, 5, 9, 13, 14]  (6 clients)
+   Unflagged-ever        : [0, 1, 2, 6, 7, 8, 10, 11, 12, 15, 16, 17, 18, 19]  (14 clients)
+
+  FLAGGED     FedAvg pre/stable: 0.615/0.446  OurMethod: 0.615/0.442  deltas: -0.000/-0.003
+  UNFLAGGED   FedAvg pre/stable: 0.767/0.682  OurMethod: 0.772/0.682  deltas: +0.005/-0.000
+
+====================================================================================================
+STEP 2: COMMUNICATION COST  (bonus metric — secondary to accuracy)
+====================================================================================================
+
+  Model size: 107,690 params  (420.7 KiB / client / round)
+  Full upload per round (20 clients): 8413.3 KiB
+  Full run total (200 rounds, all clients): 1643.2 MiB
+
+  Baseline methods (FedAvg, Flash, AdaptiveFedAvg): all upload the FULL model
+    every round from every client => 1643.2 MiB total per run
+
+  OurMethod: skips flagged layers per (client, round). Per-seed breakdown:
+
+  Seed        Bytes uploaded     vs FedAvg       Saved     Skips
+  ------------------------------------------------------------
+  1               1632.93 MiB        99.37%    10.29 MiB        56
+  2               1631.88 MiB        99.31%    11.34 MiB        56
+
+  Interpretation: total savings are modest (~few MiB) because flagging
+  is concentrated in the ~14-round drift window. The structural property
+  is what matters: OurMethod transmits STRICTLY LESS during drift, and
+  the SAME as FedAvg in steady state — never more.
+
