@@ -365,7 +365,26 @@ Savings are tiny (~0.6%) because flagging is concentrated in ~14 rounds of 200. 
 
 ---
 
-## 9. Reproducibility
+## 9. Figures
+
+All figures are in `figures/`, regenerated from CSVs by `generate_figures.py`.
+
+| File | Shows |
+|---|---|
+| `figures/fig1_single_drift_curves.png` | Global test accuracy over rounds, all 4 methods, 3-seed mean ± std band, single-event drift at round 100 |
+| `figures/fig2_recurrent_drift_curves.png` | Same shape as Fig 1, 2-seed mean ± std band, two drift events at rounds 100 and 150 |
+| `figures/fig3_hybrid_lift_trajectory.png` | Per-round mean(hybrid − global) on flagged clients during the drift window, OurMethod, 3 seeds. The headline graph for the adaptation claim — +45–60pp peak. |
+| `figures/fig4_drift_dips_bar.png` | Per-event accuracy-dip magnitudes per method, recurrent drift, 2-seed mean ± std. Event 1 dip is consistently larger. |
+| `figures/fig5_flag_counts_timeline.png` | Flagged-client count per round for OurMethod, 3 seeds, single-event drift. Sharp spike at round 100, zero false positives elsewhere. |
+| `figures/fig6_method_summary_bar.png` | Three-panel bar chart: pre-drift, dip, post-drift stable accuracy per method, 3-seed mean ± std (single drift). |
+
+To regenerate after new runs:
+
+```bash
+./venv/Scripts/python.exe generate_figures.py
+```
+
+## 10. Reproducibility
 
 All code, raw CSVs, run logs, and analysis scripts are in the repo under their respective `runs/<date>-<tag>/` folder. Each folder includes a `RUN_NOTES.md` with the launching command, git commit at run time, and final metric summary.
 
@@ -381,6 +400,6 @@ The current `recurrent-drift` branch contains the multi-event drift code; the `m
 
 ---
 
-## 10. One-paragraph summary for non-experts
+## 11. One-paragraph summary for non-experts
 
 We tested whether a new federated-learning method handles a specific kind of data problem (where different users' data starts to "mean" something different over time — concept drift). Across multiple controlled experiments, we found that the method **correctly identifies which users are affected by the drift** (100% precision, never wrongly flags an undisturbed user), and **gives each flagged user a personalized model that is 35 percentage points more accurate** on their own data than the alternatives. On the standard "average accuracy across all users" metric, our method is about 1 percentage point better than the simplest baseline (FedAvg) under single drift, and statistically tied under repeated drift. It clearly beats two other published methods (Flash, Adaptive-FedAvg). The main contribution is the **mechanism** — being able to spot exactly who is affected and adapt for them specifically — rather than a large numerical win on aggregate accuracy.
