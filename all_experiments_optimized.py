@@ -96,14 +96,42 @@ LR             = 0.01
 MOMENTUM       = 0.9
 WEIGHT_DECAY   = 1e-5
 ALPHA_DIR      = 0.1
-DRIFT_ROUND    = 100
 SEED           = 0
 DEVICE         = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Sudden drift groups — FedCCFA layout, client_id % 10 rule
-DRIFT_GROUP_A  = [i for i in range(NUM_CLIENTS) if i % 10 < 3]    # swap 1<->2
-DRIFT_GROUP_B  = [i for i in range(NUM_CLIENTS) if 3 <= i % 10 < 6] # swap 3<->4
-DRIFT_GROUP_C  = [i for i in range(NUM_CLIENTS) if i % 10 >= 6]   # swap 5<->6
+# Drift schedule.
+# DEFAULT: single sudden-drift event at round 100 (original FedCCFA setup).
+# Pass --recurrent on the CLI to override to the recurrent schedule [100, 150].
+#
+# Each entry in DRIFT_SCHEDULE is the round at which a drift event fires. The
+# per-event swap mapping in DRIFT_EVENTS must have an entry for each scheduled
+# round (and DRIFT_EVENTS keeps both mappings so the recurrent flag can flip
+# the schedule without changing the swap table).
+#
+# CONSTRAINT (recurrent only): per group, the label pair at event k+1 must be
+# DISJOINT from the pair at event k for that group. Otherwise applying
+# _swap_labels_gpu twice on the same pair would TOGGLE (involution) and undo
+# the drift. The default DRIFT_EVENTS table satisfies this constraint.
+DRIFT_SCHEDULE_SINGLE    = [100]              # default
+DRIFT_SCHEDULE_RECURRENT = [100, 150]         # used when --recurrent is passed
+DRIFT_SCHEDULE = list(DRIFT_SCHEDULE_SINGLE)  # active schedule; overridable in __main__
+DRIFT_EVENTS = [
+    # Event 0 (round 100) — original sudden-drift swaps from FedCCFA
+    {'A': (1, 2), 'B': (3, 4), 'C': (5, 6)},
+    # Event 1 (round 150) — rotated, each group's pair is disjoint from its event-0 pair.
+    # Only consumed when DRIFT_SCHEDULE has >= 2 entries (--recurrent enabled).
+    {'A': (3, 4), 'B': (5, 6), 'C': (7, 8)},
+]
+assert len(DRIFT_EVENTS) >= len(DRIFT_SCHEDULE_RECURRENT), \
+    "Need a swap mapping in DRIFT_EVENTS for every entry in DRIFT_SCHEDULE_RECURRENT"
+
+# Sudden drift groups — FedCCFA layout, client_id % 10 rule.
+# Group membership does NOT change across events; only the label pair that
+# gets swapped for that group at each event changes.
+DRIFT_GROUP_A  = [i for i in range(NUM_CLIENTS) if i % 10 < 3]
+DRIFT_GROUP_B  = [i for i in range(NUM_CLIENTS) if 3 <= i % 10 < 6]
+DRIFT_GROUP_C  = [i for i in range(NUM_CLIENTS) if i % 10 >= 6]
+DRIFT_GROUPS   = {'A': DRIFT_GROUP_A, 'B': DRIFT_GROUP_B, 'C': DRIFT_GROUP_C}
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
@@ -114,7 +142,7 @@ if torch.cuda.is_available():
 print(f"Device: {DEVICE}")
 print(f"CPU cores detected: {os.cpu_count()}")
 print(f"Config: {NUM_CLIENTS} clients | alpha={ALPHA_DIR} | "
-      f"{LOCAL_EPOCHS} epochs | {NUM_ROUNDS} rounds | drift at {DRIFT_ROUND}")
+      f"{LOCAL_EPOCHS} epochs | {NUM_ROUNDS} rounds | drift schedule {DRIFT_SCHEDULE}")
 print(f"Pipeline: GPU-resident dataset + GPU-side augmentation")
 print(f"Batch size: {BATCH_SIZE} | drop_last=True | num_workers=0")
 
@@ -207,15 +235,26 @@ def _swap_labels_gpu(y, a, b):
     y[mask_b] = a
 
 
-def apply_drift_gpu(client_y):
-    """Apply FedCCFA sudden_drift label swaps to the per-method y dict."""
-    print(f"\n  *** Sudden drift at round {DRIFT_ROUND} ***")
-    print(f"  Group A {DRIFT_GROUP_A}: swap 1<->2")
-    print(f"  Group B {DRIFT_GROUP_B}: swap 3<->4")
-    print(f"  Group C {DRIFT_GROUP_C}: swap 5<->6")
-    for cid in DRIFT_GROUP_A: _swap_labels_gpu(client_y[cid], 1, 2)
-    for cid in DRIFT_GROUP_B: _swap_labels_gpu(client_y[cid], 3, 4)
-    for cid in DRIFT_GROUP_C: _swap_labels_gpu(client_y[cid], 5, 6)
+def apply_drift_event(client_y, event_idx):
+    """
+    Apply the swap mapping of DRIFT_EVENTS[event_idx] in-place on the per-method
+    client_y dict (each entry is a per-client GPU label tensor).
+
+    Each event introduces a NEW perturbation; per-group pairs at successive
+    events are required to be disjoint so that _swap_labels_gpu (an involution)
+    does not toggle previous swaps back to canonical.
+
+    The TEST_Y tensor is never passed to this function — only per-method client
+    label dicts are. Test labels remain canonical.
+    """
+    swaps = DRIFT_EVENTS[event_idx]
+    rnd   = DRIFT_SCHEDULE[event_idx]
+    print(f"\n  *** Drift event {event_idx} at round {rnd} ***")
+    for group_label, group_clients in DRIFT_GROUPS.items():
+        a, b = swaps[group_label]
+        print(f"  Group {group_label} {group_clients}: swap {a}<->{b}")
+        for cid in group_clients:
+            _swap_labels_gpu(client_y[cid], a, b)
 
 
 # ============================================================
@@ -428,8 +467,8 @@ def run_fedavg():
 
     try:
         for rnd in range(NUM_ROUNDS):
-            if rnd == DRIFT_ROUND:
-                apply_drift_gpu(client_y)
+            if rnd in DRIFT_SCHEDULE:
+                apply_drift_event(client_y, DRIFT_SCHEDULE.index(rnd))
 
             states, weights = [], []
             for cid in range(NUM_CLIENTS):
@@ -446,8 +485,8 @@ def run_fedavg():
             log.append(row)
             csv_out.write(row)
 
-            if rnd % 10 == 0 or rnd == DRIFT_ROUND:
-                tag = "  <-- DRIFT" if rnd == DRIFT_ROUND else ""
+            if rnd % 10 == 0 or rnd in DRIFT_SCHEDULE:
+                tag = "  <-- DRIFT" if rnd in DRIFT_SCHEDULE else ""
                 mean_local = sum(local_accs) / len(local_accs)
                 print(f"  Round {rnd:03d} | Global: {acc:.4f} | "
                       f"mean local: {mean_local:.4f}{tag}")
@@ -489,8 +528,8 @@ def run_flash():
 
     try:
         for rnd in range(NUM_ROUNDS):
-            if rnd == DRIFT_ROUND:
-                apply_drift_gpu(client_y)
+            if rnd in DRIFT_SCHEDULE:
+                apply_drift_event(client_y, DRIFT_SCHEDULE.index(rnd))
 
             updates, weights = [], []
             for cid in range(NUM_CLIENTS):
@@ -563,8 +602,8 @@ def run_flash():
             log.append(row)
             csv_out.write(row)
 
-            if rnd % 10 == 0 or rnd == DRIFT_ROUND:
-                tag = "  <-- DRIFT" if rnd == DRIFT_ROUND else ""
+            if rnd % 10 == 0 or rnd in DRIFT_SCHEDULE:
+                tag = "  <-- DRIFT" if rnd in DRIFT_SCHEDULE else ""
                 mean_local = sum(local_accs) / len(local_accs)
                 print(f"  Round {rnd:03d} | Global: {acc:.4f} | "
                       f"mean local: {mean_local:.4f}{tag}")
@@ -609,8 +648,8 @@ def run_adaptive_fedavg():
 
     try:
         for rnd in range(NUM_ROUNDS):
-            if rnd == DRIFT_ROUND:
-                apply_drift_gpu(client_y)
+            if rnd in DRIFT_SCHEDULE:
+                apply_drift_event(client_y, DRIFT_SCHEDULE.index(rnd))
 
             states, weights = [], []
             for cid in range(NUM_CLIENTS):
@@ -658,8 +697,8 @@ def run_adaptive_fedavg():
             log.append(row)
             csv_out.write(row)
 
-            if rnd % 10 == 0 or rnd == DRIFT_ROUND:
-                tag = "  <-- DRIFT" if rnd == DRIFT_ROUND else ""
+            if rnd % 10 == 0 or rnd in DRIFT_SCHEDULE:
+                tag = "  <-- DRIFT" if rnd in DRIFT_SCHEDULE else ""
                 mean_local = sum(local_accs) / len(local_accs)
                 print(f"  Round {rnd:03d} | Global: {acc:.4f} | "
                       f"mean local: {mean_local:.4f} | "
@@ -858,8 +897,8 @@ def run_our_method():
 
     try:
         for rnd in range(NUM_ROUNDS):
-            if rnd == DRIFT_ROUND:
-                apply_drift_gpu(client_y)
+            if rnd in DRIFT_SCHEDULE:
+                apply_drift_event(client_y, DRIFT_SCHEDULE.index(rnd))
 
             gs = {k: v.clone() for k, v in gm.state_dict().items()}
             for c in clients:
@@ -894,9 +933,9 @@ def run_our_method():
                 'global_acc': acc,
             })
 
-            if (rnd % 10 == 0 or rnd == DRIFT_ROUND or
-                    DRIFT_ROUND <= rnd <= DRIFT_ROUND + 20):
-                tag = "  <-- DRIFT" if rnd == DRIFT_ROUND else ""
+            if (rnd % 10 == 0 or rnd in DRIFT_SCHEDULE or
+                    any(d <= rnd <= d + 20 for d in DRIFT_SCHEDULE)):
+                tag = "  <-- DRIFT" if rnd in DRIFT_SCHEDULE else ""
                 # Hybrid lift on flagged clients (the metric the thesis cares about)
                 if flagged_any:
                     fh = [hybrid_accs[c] for c in flagged_any]
@@ -967,11 +1006,16 @@ def drift_dataset_legacy(dataset, a, b):
         dataset.targets[i] = b
 
 
-def apply_drift_legacy(client_sets):
-    print(f"\n  *** Sudden drift at round {DRIFT_ROUND} ***")
-    for cid in DRIFT_GROUP_A: drift_dataset_legacy(client_sets[cid], 1, 2)
-    for cid in DRIFT_GROUP_B: drift_dataset_legacy(client_sets[cid], 3, 4)
-    for cid in DRIFT_GROUP_C: drift_dataset_legacy(client_sets[cid], 5, 6)
+def apply_drift_legacy(client_sets, event_idx):
+    """LEGACY (CPU) counterpart of apply_drift_event for CDA-FedAvg's older path.
+    Same DRIFT_EVENTS mapping; mutates dataset.targets in place."""
+    swaps = DRIFT_EVENTS[event_idx]
+    rnd   = DRIFT_SCHEDULE[event_idx]
+    print(f"\n  *** Drift event {event_idx} at round {rnd} (legacy) ***")
+    for group_label, group_clients in DRIFT_GROUPS.items():
+        a, b = swaps[group_label]
+        for cid in group_clients:
+            drift_dataset_legacy(client_sets[cid], a, b)
 
 
 def evaluate_legacy(model, loader):
@@ -1124,8 +1168,8 @@ def run_cda_fedavg():
     csv_out = LiveCSV('results_CDAFedAvg.csv', ['round', 'global_acc'])
     try:
         for rnd in range(NUM_ROUNDS):
-            if rnd == DRIFT_ROUND:
-                apply_drift_legacy(client_sets)
+            if rnd in DRIFT_SCHEDULE:
+                apply_drift_legacy(client_sets, DRIFT_SCHEDULE.index(rnd))
                 for c in clients:
                     c.dataset = client_sets[c.cid]
             gs = {k: v.clone() for k, v in gm.state_dict().items()}
@@ -1139,8 +1183,8 @@ def run_cda_fedavg():
             acc = evaluate_legacy(gm, global_loader)
             log.append({'round': rnd, 'global_acc': acc})
             csv_out.write({'round': rnd, 'global_acc': acc})
-            if rnd % 10 == 0 or rnd == DRIFT_ROUND:
-                tag = "  <-- DRIFT" if rnd == DRIFT_ROUND else ""
+            if rnd % 10 == 0 or rnd in DRIFT_SCHEDULE:
+                tag = "  <-- DRIFT" if rnd in DRIFT_SCHEDULE else ""
                 print(f"  Round {rnd:03d} | Global: {acc:.4f}{tag}")
     finally:
         csv_out.close()
@@ -1187,6 +1231,12 @@ def parse_args():
                         "_seed<N> filename suffix is dropped (the folder "
                         "encodes the seed). Use this to land results "
                         "straight into a runs/<tag>/seed<N>/ folder.")
+    p.add_argument('--recurrent', action='store_true',
+                   help=f"Enable recurrent drift. With this flag, drift fires "
+                        f"at rounds {DRIFT_SCHEDULE_RECURRENT}; without it, "
+                        f"the default schedule {DRIFT_SCHEDULE_SINGLE} (single "
+                        f"sudden-drift event) is used. Per-event swap mappings "
+                        f"come from DRIFT_EVENTS.")
     return p.parse_args()
 
 
@@ -1207,20 +1257,80 @@ def resolve_methods(arg_list):
     return out
 
 
+def _per_group_acc_at_round(row, group_clients, col_prefix='local_c'):
+    """Mean of per-client local-acc columns over clients in the group, for one round."""
+    vals = []
+    for cid in group_clients:
+        key = f'{col_prefix}{cid:02d}'
+        if key in row:
+            vals.append(float(row[key]))
+    return float(np.mean(vals)) if vals else None
+
+
 def summarize_method(name, log):
+    """
+    Headline metrics around the first drift event (back-compat with downstream
+    analyses) plus per-event and per-group dip recap for multi-event schedules.
+    """
     accs = [r['global_acc'] for r in log]
-    if len(accs) < DRIFT_ROUND + 11:
+    first_drift = DRIFT_SCHEDULE[0]
+    if len(accs) < first_drift + 11:
         return  # short run, skip
-    pre   = float(np.mean(accs[max(0, DRIFT_ROUND-11):DRIFT_ROUND]))
-    dip   = pre - min(accs[DRIFT_ROUND:DRIFT_ROUND+10])
-    rec   = next((i - DRIFT_ROUND for i in range(DRIFT_ROUND, len(accs))
+
+    # Headline metrics — anchored at the FIRST drift event (unchanged interpretation)
+    pre   = float(np.mean(accs[max(0, first_drift-11):first_drift]))
+    dip   = pre - min(accs[first_drift:first_drift+10])
+    rec   = next((i - first_drift for i in range(first_drift, len(accs))
                   if accs[i] >= pre - 0.02), None)
     stable = float(np.mean(accs[-10:]))
     print(f"\n{name}:")
     print(f"  Pre-drift acc:     {pre:.4f}")
-    print(f"  Accuracy dip:      {dip:.4f}")
+    print(f"  Accuracy dip:      {dip:.4f}  (at first drift event, round {first_drift})")
     print(f"  Recovery rounds:   {rec if rec is not None else 'Not recovered'}")
     print(f"  Post-drift stable: {stable:.4f}")
+
+    # Per-event GLOBAL-accuracy dip recap (one row per drift event)
+    if len(DRIFT_SCHEDULE) > 1:
+        print(f"  Per-event global dips:")
+        print(f"    {'event':<6}{'round':>7}{'pre':>10}{'min(+10)':>12}{'dip':>10}")
+        for k, d in enumerate(DRIFT_SCHEDULE):
+            if len(accs) < d + 10:
+                continue
+            pre_d = float(np.mean(accs[max(0, d-11):d]))
+            min_d = min(accs[d:d+10])
+            dip_d = pre_d - min_d
+            print(f"    {k:<6}{d:>7}{pre_d:>10.4f}{min_d:>12.4f}{dip_d:>10.4f}")
+
+    # Per-event PER-GROUP local-accuracy dip recap. Only meaningful if the log
+    # contains per-client columns (which all 4 active methods produce). Uses
+    # local_cXX (federation-view of each client). For OurMethod this is the
+    # raw shock to the system; hybrid_cXX would measure adaptation residual.
+    has_local_cols = bool(log) and any(k.startswith('local_c') for k in log[0])
+    if has_local_cols and len(DRIFT_SCHEDULE) >= 1:
+        print(f"  Per-event per-group local-acc dips (using local_cXX):")
+        header = f"    {'event':<6}{'round':>7}"
+        for gl in DRIFT_GROUPS:
+            header += f"{'pre('+gl+')':>11}{'min('+gl+')':>11}{'dip('+gl+')':>11}"
+        print(header)
+        for k, d in enumerate(DRIFT_SCHEDULE):
+            if len(log) < d + 10:
+                continue
+            line = f"    {k:<6}{d:>7}"
+            for gl, gc in DRIFT_GROUPS.items():
+                pre_vals = [_per_group_acc_at_round(log[r], gc)
+                            for r in range(max(0, d-11), d)]
+                pre_vals = [v for v in pre_vals if v is not None]
+                post_vals = [_per_group_acc_at_round(log[r], gc)
+                             for r in range(d, d+10)]
+                post_vals = [v for v in post_vals if v is not None]
+                if not pre_vals or not post_vals:
+                    line += f"{'-':>11}{'-':>11}{'-':>11}"
+                    continue
+                pre_g = float(np.mean(pre_vals))
+                min_g = min(post_vals)
+                dip_g = pre_g - min_g
+                line += f"{pre_g:>11.4f}{min_g:>11.4f}{dip_g:>11.4f}"
+            print(line)
 
 
 if __name__ == '__main__':
@@ -1233,6 +1343,10 @@ if __name__ == '__main__':
             raise SystemExit("--rounds must be >= 1")
         NUM_ROUNDS = args.rounds
         print(f"\n[--rounds override] NUM_ROUNDS={NUM_ROUNDS}")
+
+    if args.recurrent:
+        DRIFT_SCHEDULE[:] = DRIFT_SCHEDULE_RECURRENT
+        print(f"[--recurrent] DRIFT_SCHEDULE = {DRIFT_SCHEDULE} (multi-event drift)")
 
     if args.out_dir is not None:
         OUT_DIR = args.out_dir
