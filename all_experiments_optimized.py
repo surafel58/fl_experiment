@@ -99,25 +99,31 @@ ALPHA_DIR      = 0.1
 SEED           = 0
 DEVICE         = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Recurrent drift schedule.
-# Each entry is the round at which a drift event fires. The per-event swap
-# mapping in DRIFT_EVENTS must have an entry for each scheduled round.
+# Drift schedule.
+# DEFAULT: single sudden-drift event at round 100 (original FedCCFA setup).
+# Pass --recurrent on the CLI to override to the recurrent schedule [100, 150].
 #
-# CONSTRAINT: per group, the label pair at event k+1 must be DISJOINT from
-# the pair at event k for that group. Otherwise applying _swap_labels_gpu
-# twice on the same pair would TOGGLE (involution) and undo the drift.
+# Each entry in DRIFT_SCHEDULE is the round at which a drift event fires. The
+# per-event swap mapping in DRIFT_EVENTS must have an entry for each scheduled
+# round (and DRIFT_EVENTS keeps both mappings so the recurrent flag can flip
+# the schedule without changing the swap table).
 #
-# Backward compatibility: DRIFT_SCHEDULE = [100] reproduces the original
-# single-event behavior bit-for-bit (event 0's swaps are unchanged).
-DRIFT_SCHEDULE = [100, 150]
+# CONSTRAINT (recurrent only): per group, the label pair at event k+1 must be
+# DISJOINT from the pair at event k for that group. Otherwise applying
+# _swap_labels_gpu twice on the same pair would TOGGLE (involution) and undo
+# the drift. The default DRIFT_EVENTS table satisfies this constraint.
+DRIFT_SCHEDULE_SINGLE    = [100]              # default
+DRIFT_SCHEDULE_RECURRENT = [100, 150]         # used when --recurrent is passed
+DRIFT_SCHEDULE = list(DRIFT_SCHEDULE_SINGLE)  # active schedule; overridable in __main__
 DRIFT_EVENTS = [
     # Event 0 (round 100) — original sudden-drift swaps from FedCCFA
     {'A': (1, 2), 'B': (3, 4), 'C': (5, 6)},
-    # Event 1 (round 150) — rotated, each group's pair is disjoint from its event-0 pair
+    # Event 1 (round 150) — rotated, each group's pair is disjoint from its event-0 pair.
+    # Only consumed when DRIFT_SCHEDULE has >= 2 entries (--recurrent enabled).
     {'A': (3, 4), 'B': (5, 6), 'C': (7, 8)},
 ]
-assert len(DRIFT_EVENTS) >= len(DRIFT_SCHEDULE), \
-    "Need a swap mapping in DRIFT_EVENTS for every entry in DRIFT_SCHEDULE"
+assert len(DRIFT_EVENTS) >= len(DRIFT_SCHEDULE_RECURRENT), \
+    "Need a swap mapping in DRIFT_EVENTS for every entry in DRIFT_SCHEDULE_RECURRENT"
 
 # Sudden drift groups — FedCCFA layout, client_id % 10 rule.
 # Group membership does NOT change across events; only the label pair that
@@ -1225,6 +1231,12 @@ def parse_args():
                         "_seed<N> filename suffix is dropped (the folder "
                         "encodes the seed). Use this to land results "
                         "straight into a runs/<tag>/seed<N>/ folder.")
+    p.add_argument('--recurrent', action='store_true',
+                   help=f"Enable recurrent drift. With this flag, drift fires "
+                        f"at rounds {DRIFT_SCHEDULE_RECURRENT}; without it, "
+                        f"the default schedule {DRIFT_SCHEDULE_SINGLE} (single "
+                        f"sudden-drift event) is used. Per-event swap mappings "
+                        f"come from DRIFT_EVENTS.")
     return p.parse_args()
 
 
@@ -1331,6 +1343,10 @@ if __name__ == '__main__':
             raise SystemExit("--rounds must be >= 1")
         NUM_ROUNDS = args.rounds
         print(f"\n[--rounds override] NUM_ROUNDS={NUM_ROUNDS}")
+
+    if args.recurrent:
+        DRIFT_SCHEDULE[:] = DRIFT_SCHEDULE_RECURRENT
+        print(f"[--recurrent] DRIFT_SCHEDULE = {DRIFT_SCHEDULE} (multi-event drift)")
 
     if args.out_dir is not None:
         OUT_DIR = args.out_dir
