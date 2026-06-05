@@ -1,0 +1,24 @@
+{
+    "algorithm": "FedAvg",
+    "client_num": 20,
+    "sample_ratio": 1.0,
+    "seed": 0,
+    "device": "cuda",
+    "dataset": "CIFAR10",
+    "partition": "hetero",
+    "alpha": 0.5,
+    "drift_pattern": "sudden",
+    "model": "CNN",
+    "rounds": 200,
+    "epochs": 5,
+    "momentum": 0.9,
+    "weight_decay": 1e-05,
+    "batch_size": 64,
+    "lr": 0.01
+}
+Files already downloaded and verified
+Files already downloaded and verified
+Sudden drift occurs at 100
+accuracy summary:
+0.5936059575073616
+0.59935
