@@ -208,6 +208,85 @@ for _cid in range(NUM_CLIENTS):
 
 TEST_X, TEST_Y = _to_gpu_tensors(raw_test, list(range(len(raw_test))))
 
+
+# ============================================================
+# PER-CLIENT GENERALIZED ACCURACY (FedCCFA protocol — faithful port)
+# ============================================================
+#
+# FedCCFA's metric (utils/gen_dataset.py:149, utils/drift.py:23-42,
+# entities/base.py:64-67, methods/FedAvg.py:50-51):
+#   1. 4 copies of the FULL test set, all initially undrifted.
+#   2. At drift, copies [1]/[2]/[3] get cohort A/B/C's label swaps; copy [0]
+#      stays undrifted. Each client is assigned a global_test_id in {0,1,2,3}.
+#      Initial value is 0 (matches FedCCFA's `Client(..., 0)` init).
+#   3. server.send_params(clients) before last_round_evaluate, so per-client
+#      eval uses the GLOBAL aggregated model.
+#   4. Per-client metric = mean across clients of acc(global_model,
+#      copy[client.global_test_id]).
+#
+# Memory-efficient port: ONE TEST_X (10000 images) shared by all four variants;
+# FOUR TEST_Y variants (10000 longs each). TEST_Y_VARIANTS[0] is the undrifted
+# reference; [1]/[2]/[3] are mutated in lockstep with apply_drift_event via
+# apply_test_drift_event below.
+
+TEST_Y_VARIANTS = {
+    0: TEST_Y.clone(),
+    1: TEST_Y.clone(),
+    2: TEST_Y.clone(),
+    3: TEST_Y.clone(),
+}
+CLIENT_GLOBAL_TEST_ID = [0] * NUM_CLIENTS
+
+GROUP_TO_GID = {'A': 1, 'B': 2, 'C': 3}
+
+
+def apply_test_drift_event(event_idx):
+    """Mutate TEST_Y_VARIANTS[1..3] and CLIENT_GLOBAL_TEST_ID for the event.
+    Called from apply_drift_event so the test-set swaps stay in lockstep with
+    the per-client training-label swaps. TEST_Y_VARIANTS[0] is never mutated.
+    """
+    swaps = DRIFT_EVENTS[event_idx]
+    for group_label, group_clients in DRIFT_GROUPS.items():
+        a, b = swaps[group_label]
+        gid  = GROUP_TO_GID[group_label]
+        _swap_labels_gpu(TEST_Y_VARIANTS[gid], a, b)
+        for cid in group_clients:
+            CLIENT_GLOBAL_TEST_ID[cid] = gid
+
+
+def reset_per_client_metric_state():
+    """Restore pre-drift test-set state. Called at the start of each method
+    run so cross-method drift mutations don't leak."""
+    for gid in TEST_Y_VARIANTS:
+        TEST_Y_VARIANTS[gid].copy_(TEST_Y)
+    for cid in range(NUM_CLIENTS):
+        CLIENT_GLOBAL_TEST_ID[cid] = 0
+
+
+def evaluate_per_client_gen_acc(model):
+    """FedCCFA per-client generalized accuracy.
+
+    For each client, evaluate the GLOBAL model on the full test set with that
+    client's cohort label swap, then average across clients. Clients in the
+    same cohort share a global_test_id, so we evaluate once per active variant
+    and weight by cohort size — numerically equivalent to a per-client loop.
+
+    Pre-drift (every client at gid=0) is handled by a fast path that returns
+    the single-variant accuracy directly. This makes the pre-drift identity
+    `evaluate_per_client_gen_acc(m) == evaluate_gpu(m)` bit-exact (no
+    sum(N copies of x)/N round-trip and its associated ULP rounding).
+    """
+    needed = set(CLIENT_GLOBAL_TEST_ID)
+    acc_by_gid = {gid: evaluate_gpu(model, TEST_X, TEST_Y_VARIANTS[gid])
+                  for gid in needed}
+    if len(needed) == 1:
+        return next(iter(acc_by_gid.values()))
+    cohort_sizes = {gid: 0 for gid in needed}
+    for cid in range(NUM_CLIENTS):
+        cohort_sizes[CLIENT_GLOBAL_TEST_ID[cid]] += 1
+    return sum(acc_by_gid[gid] * cohort_sizes[gid]
+               for gid in needed) / NUM_CLIENTS
+
 _resident_mb = sum(t.element_size() * t.numel() for t in
                    list(GPU_CLIENT_X.values()) +
                    list(GPU_CLIENT_Y_CLEAN.values()) +
@@ -244,8 +323,10 @@ def apply_drift_event(client_y, event_idx):
     events are required to be disjoint so that _swap_labels_gpu (an involution)
     does not toggle previous swaps back to canonical.
 
-    The TEST_Y tensor is never passed to this function — only per-method client
-    label dicts are. Test labels remain canonical.
+    The canonical TEST_Y tensor (used by `evaluate_gpu` for global accuracy)
+    is never mutated. The four TEST_Y_VARIANTS used by the FedCCFA per-client
+    metric ARE mutated here via apply_test_drift_event, so the per-cohort test
+    swaps stay in lockstep with the per-client training-label swaps.
     """
     swaps = DRIFT_EVENTS[event_idx]
     rnd   = DRIFT_SCHEDULE[event_idx]
@@ -255,6 +336,7 @@ def apply_drift_event(client_y, event_idx):
         print(f"  Group {group_label} {group_clients}: swap {a}<->{b}")
         for cid in group_clients:
             _swap_labels_gpu(client_y[cid], a, b)
+    apply_test_drift_event(event_idx)
 
 
 # ============================================================
@@ -461,9 +543,10 @@ def run_fedavg():
 
     client_y = fresh_client_y()
     gm       = get_model()
+    reset_per_client_metric_state()
     log      = []
     csv_out  = LiveCSV(seeded_path('results_FedAvg.csv'),
-                       ['round', 'global_acc'] + CLIENT_FIELDS)
+                       ['round', 'global_acc', 'per_client_gen_acc'] + CLIENT_FIELDS)
 
     try:
         for rnd in range(NUM_ROUNDS):
@@ -480,8 +563,10 @@ def run_fedavg():
 
             fedavg_aggregate(gm, states, weights)
             acc        = evaluate_gpu(gm)
+            pc_acc     = evaluate_per_client_gen_acc(gm)
             local_accs = evaluate_all_clients(gm, client_y)
-            row        = build_local_row(rnd, acc, local_accs)
+            row        = build_local_row(rnd, acc, local_accs,
+                                         extra={'per_client_gen_acc': pc_acc})
             log.append(row)
             csv_out.write(row)
 
@@ -489,6 +574,97 @@ def run_fedavg():
                 tag = "  <-- DRIFT" if rnd in DRIFT_SCHEDULE else ""
                 mean_local = sum(local_accs) / len(local_accs)
                 print(f"  Round {rnd:03d} | Global: {acc:.4f} | "
+                      f"per-client: {pc_acc:.4f} | "
+                      f"mean local: {mean_local:.4f}{tag}")
+    finally:
+        csv_out.close()
+    print(f"  Results: {csv_out.path}")
+    return log
+
+
+# ============================================================
+# METHOD 5 (control) — FedAvg + 1 local epoch
+#
+# Identical to plain FedAvg in every respect that touches the GLOBAL model:
+#   - Same client local-training (LOCAL_EPOCHS epochs per round)
+#   - Same fedavg_aggregate over the same client states with the same weights
+#   - Same global_acc evaluation on canonical TEST_Y
+# With the same seed, this method's global_acc trajectory is BIT-IDENTICAL
+# to plain FedAvg. The ONLY divergence is the per-client metric:
+#   plain FedAvg's per_client_gen_acc = acc(GLOBAL model, cohort-swapped test)
+#   FedAvg+1's    per_client_gen_acc = acc(GLOBAL + 1 local epoch on client's
+#                                          own data, cohort-swapped test)
+# This isolates trivial last-step personalization as a confound on the
+# per-client metric. Mirrors the FedAvg_baseline.py finding: +2.76pp over
+# published FedAvg at Dir(0.5).
+#
+# Plain FedAvg's run_fedavg() is NOT modified. The two are independent
+# entries in METHOD_REGISTRY (1 = FedAvg, 5 = FedAvg+1).
+# ============================================================
+
+def evaluate_per_client_gen_acc_finetuned(global_model, client_y, scratch_model):
+    """Per-client generalized accuracy where each client's eval model
+    = global_model + 1 local epoch on the client's own (possibly drifted) data.
+
+    No cohort fast-path here: each client has a DIFFERENT fine-tuned model,
+    so we cannot pre-cohort the forward passes — 20 fine-tune+eval cycles per
+    round. The 1 local epoch uses the SAME lr/optimizer/batch size as plain
+    FedAvg local training (local_train_gpu defaults: lr=LR, batch=BATCH_SIZE,
+    momentum=MOMENTUM, weight_decay=WEIGHT_DECAY, gpu_augment).
+    """
+    accs = []
+    g_state = global_model.state_dict()
+    for cid in range(NUM_CLIENTS):
+        scratch_model.load_state_dict({k: v.clone() for k, v in g_state.items()})
+        local_train_gpu(scratch_model, GPU_CLIENT_X[cid], client_y[cid], epochs=1)
+        gid = CLIENT_GLOBAL_TEST_ID[cid]
+        accs.append(evaluate_gpu(scratch_model, TEST_X, TEST_Y_VARIANTS[gid]))
+    return sum(accs) / len(accs)
+
+
+def run_fedavg_plus1():
+    print("\n" + "="*60)
+    print("METHOD 5 (control): FedAvg + 1 local epoch")
+    print("  global eval     -> global aggregated model, canonical TEST_Y")
+    print("  per-client eval -> each client's (global + 1 local epoch) model")
+    print("="*60)
+
+    client_y         = fresh_client_y()
+    gm               = get_model()
+    finetune_scratch = get_model()
+    reset_per_client_metric_state()
+    log     = []
+    csv_out = LiveCSV(seeded_path('results_FedAvgPlus1.csv'),
+                      ['round', 'global_acc', 'per_client_gen_acc'] + CLIENT_FIELDS)
+
+    try:
+        for rnd in range(NUM_ROUNDS):
+            if rnd in DRIFT_SCHEDULE:
+                apply_drift_event(client_y, DRIFT_SCHEDULE.index(rnd))
+
+            states, weights = [], []
+            for cid in range(NUM_CLIENTS):
+                lm = get_model()
+                lm.load_state_dict({k: v.clone() for k, v in gm.state_dict().items()})
+                local_train_gpu(lm, GPU_CLIENT_X[cid], client_y[cid])
+                states.append(lm.state_dict())
+                weights.append(CLIENT_WEIGHTS[cid])
+
+            fedavg_aggregate(gm, states, weights)
+            acc        = evaluate_gpu(gm)
+            pc_acc     = evaluate_per_client_gen_acc_finetuned(gm, client_y,
+                                                               finetune_scratch)
+            local_accs = evaluate_all_clients(gm, client_y)
+            row        = build_local_row(rnd, acc, local_accs,
+                                         extra={'per_client_gen_acc': pc_acc})
+            log.append(row)
+            csv_out.write(row)
+
+            if rnd % 10 == 0 or rnd in DRIFT_SCHEDULE:
+                tag = "  <-- DRIFT" if rnd in DRIFT_SCHEDULE else ""
+                mean_local = sum(local_accs) / len(local_accs)
+                print(f"  Round {rnd:03d} | Global: {acc:.4f} | "
+                      f"per-client(finetuned): {pc_acc:.4f} | "
                       f"mean local: {mean_local:.4f}{tag}")
     finally:
         csv_out.close()
@@ -514,9 +690,10 @@ def run_flash():
 
     client_y = fresh_client_y()
     gm       = get_model()
+    reset_per_client_metric_state()
     log      = []
     csv_out  = LiveCSV(seeded_path('results_Flash.csv'),
-                       ['round', 'global_acc'] + CLIENT_FIELDS)
+                       ['round', 'global_acc', 'per_client_gen_acc'] + CLIENT_FIELDS)
     crit     = nn.CrossEntropyLoss()
 
     first_mom  = 0
@@ -597,8 +774,10 @@ def run_flash():
             vector_to_parameters(new_global, gm.parameters())
 
             acc        = evaluate_gpu(gm)
+            pc_acc     = evaluate_per_client_gen_acc(gm)
             local_accs = evaluate_all_clients(gm, client_y)
-            row        = build_local_row(rnd, acc, local_accs)
+            row        = build_local_row(rnd, acc, local_accs,
+                                         extra={'per_client_gen_acc': pc_acc})
             log.append(row)
             csv_out.write(row)
 
@@ -606,6 +785,7 @@ def run_flash():
                 tag = "  <-- DRIFT" if rnd in DRIFT_SCHEDULE else ""
                 mean_local = sum(local_accs) / len(local_accs)
                 print(f"  Round {rnd:03d} | Global: {acc:.4f} | "
+                      f"per-client: {pc_acc:.4f} | "
                       f"mean local: {mean_local:.4f}{tag}")
     finally:
         csv_out.close()
@@ -633,9 +813,10 @@ def run_adaptive_fedavg():
 
     client_y = fresh_client_y()
     gm       = get_model()
+    reset_per_client_metric_state()
     log      = []
     csv_out  = LiveCSV(seeded_path('results_AdaptiveFedAvg.csv'),
-                       ['round', 'global_acc', 'client_lr'] + CLIENT_FIELDS)
+                       ['round', 'global_acc', 'per_client_gen_acc', 'client_lr'] + CLIENT_FIELDS)
 
     # Server-side adaptive-LR state
     prev_mean          = 0.0
@@ -691,9 +872,11 @@ def run_adaptive_fedavg():
                                    client_init_lr * ratio_norm / cur_round))
 
             acc        = evaluate_gpu(gm)
+            pc_acc     = evaluate_per_client_gen_acc(gm)
             local_accs = evaluate_all_clients(gm, client_y)
             row        = build_local_row(rnd, acc, local_accs,
-                                         extra={'client_lr': current_lr})
+                                         extra={'per_client_gen_acc': pc_acc,
+                                                'client_lr': current_lr})
             log.append(row)
             csv_out.write(row)
 
@@ -701,6 +884,7 @@ def run_adaptive_fedavg():
                 tag = "  <-- DRIFT" if rnd in DRIFT_SCHEDULE else ""
                 mean_local = sum(local_accs) / len(local_accs)
                 print(f"  Round {rnd:03d} | Global: {acc:.4f} | "
+                      f"per-client: {pc_acc:.4f} | "
                       f"mean local: {mean_local:.4f} | "
                       f"lr={current_lr:.5f}{tag}")
     finally:
@@ -883,12 +1067,14 @@ def run_our_method():
 
     client_y    = fresh_client_y()
     gm          = get_model()
+    reset_per_client_metric_state()
     clients     = [OurClient(i) for i in range(NUM_CLIENTS)]
     hybrid_temp = get_model()   # reused buffer for hybrid-model evaluation
     log         = []
 
     csv_out  = LiveCSV(seeded_path('results_OurMethod.csv'),
-                       ['round', 'global_acc'] + CLIENT_FIELDS + HYBRID_FIELDS)
+                       ['round', 'global_acc', 'per_client_gen_acc']
+                       + CLIENT_FIELDS + HYBRID_FIELDS)
     flag_csv = LiveCSV(seeded_path('results_OurMethod_flags.csv'), [
         'round', 'flagged_count',
         'flagged_layer3_count', 'flagged_layer4_count',
@@ -908,12 +1094,14 @@ def run_our_method():
             per_layer_fedavg_our(gm, clients, weights)
 
             acc        = evaluate_gpu(gm)
+            pc_acc     = evaluate_per_client_gen_acc(gm)
             local_accs = evaluate_all_clients(gm, client_y)
             # HYBRID: per-client accuracy of the model each client actually uses
             # next round (global for unflagged layers + classifier, local for flagged).
             hybrid_accs = evaluate_all_clients_hybrid(gm, clients, client_y, hybrid_temp)
 
-            row = build_local_row(rnd, acc, local_accs)
+            row = build_local_row(rnd, acc, local_accs,
+                                  extra={'per_client_gen_acc': pc_acc})
             for cid, h in enumerate(hybrid_accs):
                 row[f'hybrid_c{cid:02d}'] = h
             log.append(row)
@@ -945,6 +1133,7 @@ def run_our_method():
                 else:
                     hyb_str = ""
                 print(f"  Round {rnd:03d} | Global: {acc:.4f} | "
+                      f"per-client: {pc_acc:.4f} | "
                       f"Flagged: {len(flagged_any)}/{NUM_CLIENTS} "
                       f"(L3:{len(flagged_layer3)}, L4:{len(flagged_layer4)}) "
                       f"IDs: {flagged_any}{hyb_str}{tag}")
@@ -1200,6 +1389,7 @@ METHOD_REGISTRY = {
     2: ('Flash',           run_flash),
     3: ('AdaptiveFedAvg',  run_adaptive_fedavg),
     4: ('OurMethod',       run_our_method),
+    5: ('FedAvgPlus1',     run_fedavg_plus1),   # control: FedAvg + 1 local epoch for per-client eval only
 }
 
 
@@ -1212,13 +1402,14 @@ def parse_args():
                 "  2  Flash\n"
                 "  3  AdaptiveFedAvg\n"
                 "  4  OurMethod\n"
+                "  5  FedAvgPlus1 (control: FedAvg + 1 local epoch for per-client eval only)\n"
                 "\nExamples:\n"
                 "  python3 all_experiments_optimized.py\n"
                 "  python3 all_experiments_optimized.py --methods 1\n"
                 "  python3 all_experiments_optimized.py --methods 1 2 4\n"
                 "  python3 all_experiments_optimized.py --methods all\n"))
     p.add_argument('--methods', nargs='+', default=['all'],
-                   help="Method IDs (1..4) or 'all' (default).")
+                   help="Method IDs (1..5) or 'all' (default; methods 1..5 only).")
     p.add_argument('--rounds', type=int, default=None,
                    help=f"Override total rounds (default {NUM_ROUNDS}). "
                         f"For smoke tests, use a small value like 10.")
@@ -1249,9 +1440,9 @@ def resolve_methods(arg_list):
             n = int(a)
         except ValueError:
             raise SystemExit(f"Unknown --methods value: {a!r}. "
-                             f"Use 1..4 or 'all'.")
+                             f"Use 1..5 or 'all'.")
         if n not in METHOD_REGISTRY:
-            raise SystemExit(f"Unknown method id: {n}. Valid: 1..4")
+            raise SystemExit(f"Unknown method id: {n}. Valid: 1..5")
         if n not in out:
             out.append(n)
     return out
