@@ -804,6 +804,12 @@ ADAPTIVE_BETA1 = 0.7    # mean EMA
 ADAPTIVE_BETA2 = 0.3    # variance EMA
 ADAPTIVE_BETA3 = 0.7    # ratio EMA
 
+# AdaptiveFedAvg's client_init_lr (the LR the scheduler scales). Defaults to
+# the harness's LR. Overridable via --adaptive-init-lr for FedDrift-style LR
+# search on AdaptiveFedAvg (Jothimurugesan et al. 2023 § 5.3 — Adaptive-FedAvg
+# uses its own internal LR scheduler so it gets a separate LR sweep).
+ADAPTIVE_INIT_LR = LR
+
 
 def run_adaptive_fedavg():
     print("\n" + "="*60)
@@ -824,8 +830,8 @@ def run_adaptive_fedavg():
     prev_variance      = 0.0
     prev_variance_norm = 0.0
     prev_ratio         = 0.0
-    client_init_lr     = LR
-    current_lr         = LR
+    client_init_lr     = ADAPTIVE_INIT_LR
+    current_lr         = ADAPTIVE_INIT_LR
 
     try:
         for rnd in range(NUM_ROUNDS):
@@ -868,8 +874,16 @@ def run_adaptive_fedavg():
             prev_variance_norm = variance_norm
             prev_ratio         = ratio
 
+            # NOTE: FedCCFA's AdaptiveFedAvgServer.cal_adaptive_lr divides the
+            # final LR by `cur_round`, producing a 1/t decay that drives the LR
+            # near zero before drift hits (e.g. 1e-4 at round 100 with base
+            # 1e-2). That divisor contradicts the algorithm's stated purpose —
+            # to RAISE the LR when update-variance spikes at drift — and is not
+            # present in Saile et al. 2024's independent implementation of the
+            # same algorithm. We remove the /cur_round divisor here. Bias
+            # correction on the three EMAs (1 - beta^t) is retained.
             current_lr = float(min(client_init_lr,
-                                   client_init_lr * ratio_norm / cur_round))
+                                   client_init_lr * ratio_norm))
 
             acc        = evaluate_gpu(gm)
             pc_acc     = evaluate_per_client_gen_acc(gm)
@@ -1428,6 +1442,11 @@ def parse_args():
                         f"the default schedule {DRIFT_SCHEDULE_SINGLE} (single "
                         f"sudden-drift event) is used. Per-event swap mappings "
                         f"come from DRIFT_EVENTS.")
+    p.add_argument('--adaptive-init-lr', type=float, default=None,
+                   help=f"Override the initial LR for AdaptiveFedAvg (method 3) "
+                        f"only. Other methods continue to use LR={LR}. Used for "
+                        f"the FedDrift-style LR sweep on AdaptiveFedAvg (its "
+                        f"internal scheduler needs its own LR selected).")
     return p.parse_args()
 
 
@@ -1538,6 +1557,10 @@ if __name__ == '__main__':
     if args.recurrent:
         DRIFT_SCHEDULE[:] = DRIFT_SCHEDULE_RECURRENT
         print(f"[--recurrent] DRIFT_SCHEDULE = {DRIFT_SCHEDULE} (multi-event drift)")
+
+    if args.adaptive_init_lr is not None:
+        ADAPTIVE_INIT_LR = args.adaptive_init_lr
+        print(f"[--adaptive-init-lr] ADAPTIVE_INIT_LR = {ADAPTIVE_INIT_LR}")
 
     if args.out_dir is not None:
         OUT_DIR = args.out_dir
