@@ -1,0 +1,76 @@
+============================================================
+Experiment log: experiment_log_20260611_124908.txt
+Started at: 2026-06-11 12:49:08
+============================================================
+Device: cuda
+CPU cores detected: 4
+Config: 20 clients | alpha=0.1 | 5 epochs | 200 rounds | drift schedule [100]
+Pipeline: GPU-resident dataset + GPU-side augmentation
+Batch size: 64 | drop_last=True | num_workers=0
+Downloading CIFAR-10...
+/usr/local/lib/python3.12/dist-packages/torchvision/datasets/cifar.py:83: VisibleDeprecationWarning: dtype(): align should be passed as Python or NumPy boolean but got `align=0`. Did you mean to pass a tuple to create a subarray type? (Deprecated NumPy 2.4)
+  entry = pickle.load(f, encoding="latin1")
+Partitioning...
+Samples/client: min=127 max=5338 mean=2500
+Pre-loading GPU-resident tensors...
+GPU-resident dataset memory: 703.6 MiB
+Model: CifarCNN | Params: 107,690
+
+[--rounds override] NUM_ROUNDS=200
+[--saile-init-lr] SAILE_INIT_LR = 0.01
+[--out-dir] CSVs will be written to: runs/2026-06-11-saile-lr-sweep/lr_0p01//
+
+============================================================
+RUNNING METHODS: Saile
+Rounds per method: 200
+============================================================
+
+============================================================
+METHOD 6: Saile (per-client loss-EMA dynamic LR)
+  initial_lr=0.01 | lr_decay=0.99/round | b1=0.7 b2=0.3 b3=0.7
+  Decay brings base_lr from 0.01 to 0.0037 at round 100, 0.0014 at round 199.
+============================================================
+  Round 000 | Global: 0.2119 | per-client: 0.2119 | base_lr=0.00990 | lr min/mean/max=0.01000/0.01000/0.01000
+  Round 010 | Global: 0.5132 | per-client: 0.5132 | base_lr=0.00895 | lr min/mean/max=0.00452/0.00814/0.01000
+  Round 020 | Global: 0.6028 | per-client: 0.6028 | base_lr=0.00810 | lr min/mean/max=0.00646/0.00914/0.01000
+  Round 030 | Global: 0.6497 | per-client: 0.6497 | base_lr=0.00732 | lr min/mean/max=0.00548/0.00935/0.01000
+  Round 040 | Global: 0.6733 | per-client: 0.6733 | base_lr=0.00662 | lr min/mean/max=0.00627/0.00941/0.01000
+  Round 050 | Global: 0.6845 | per-client: 0.6845 | base_lr=0.00599 | lr min/mean/max=0.00604/0.00888/0.01000
+  Round 060 | Global: 0.6966 | per-client: 0.6966 | base_lr=0.00542 | lr min/mean/max=0.00456/0.00853/0.01000
+  Round 070 | Global: 0.7022 | per-client: 0.7022 | base_lr=0.00490 | lr min/mean/max=0.00599/0.00873/0.01000
+  Round 080 | Global: 0.7030 | per-client: 0.7030 | base_lr=0.00443 | lr min/mean/max=0.00579/0.00890/0.01000
+  Round 090 | Global: 0.7023 | per-client: 0.7023 | base_lr=0.00401 | lr min/mean/max=0.00369/0.00708/0.01000
+
+  *** Drift event 0 at round 100 ***
+  Group A [0, 1, 2, 10, 11, 12]: swap 1<->2
+  Group B [3, 4, 5, 13, 14, 15]: swap 3<->4
+  Group C [6, 7, 8, 9, 16, 17, 18, 19]: swap 5<->6
+  Round 100 | Global: 0.6154 | per-client: 0.5389 | base_lr=0.00362 | lr min/mean/max=0.00465/0.00923/0.01000  <-- DRIFT
+  Round 110 | Global: 0.5869 | per-client: 0.5470 | base_lr=0.00328 | lr min/mean/max=0.00309/0.00763/0.01000
+  Round 120 | Global: 0.5925 | per-client: 0.5492 | base_lr=0.00296 | lr min/mean/max=0.00291/0.00568/0.01000
+  Round 130 | Global: 0.5858 | per-client: 0.5457 | base_lr=0.00268 | lr min/mean/max=0.00295/0.00530/0.01000
+  Round 140 | Global: 0.5810 | per-client: 0.5440 | base_lr=0.00242 | lr min/mean/max=0.00209/0.00559/0.01000
+  Round 150 | Global: 0.5934 | per-client: 0.5470 | base_lr=0.00219 | lr min/mean/max=0.00188/0.00459/0.01000
+  Round 160 | Global: 0.5875 | per-client: 0.5487 | base_lr=0.00198 | lr min/mean/max=0.00178/0.00559/0.01000
+  Round 170 | Global: 0.5938 | per-client: 0.5487 | base_lr=0.00179 | lr min/mean/max=0.00151/0.00382/0.01000
+  Round 180 | Global: 0.5755 | per-client: 0.5404 | base_lr=0.00162 | lr min/mean/max=0.00153/0.00401/0.01000
+  Round 190 | Global: 0.5785 | per-client: 0.5466 | base_lr=0.00147 | lr min/mean/max=0.00134/0.00306/0.00895
+  Results: runs/2026-06-11-saile-lr-sweep/lr_0p01/results_Saile.csv
+
+============================================================
+FINAL RESULTS SUMMARY
+============================================================
+
+Saile:
+  Pre-drift acc:     0.7068
+  Accuracy dip:      0.1194  (at first drift event, round 100)
+  Recovery rounds:   Not recovered
+  Post-drift stable: 0.5844
+  Per-event per-group local-acc dips (using local_cXX):
+    event   round     pre(A)     min(A)     dip(A)     pre(B)     min(B)     dip(B)     pre(C)     min(C)     dip(C)
+    0         100     0.7728     0.6326     0.1401     0.6411     0.3708     0.2703     0.7712     0.5649     0.2063
+
+Finished at: 2026-06-11 13:23:09
+Full output log: experiment_log_20260611_124908.txt
+CSV files saved per method (live):
+  - results_Saile.csv

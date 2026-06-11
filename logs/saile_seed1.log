@@ -1,0 +1,79 @@
+============================================================
+Experiment log: experiment_log_20260611_133509.txt
+Started at: 2026-06-11 13:35:09
+============================================================
+Device: cuda
+CPU cores detected: 4
+Config: 20 clients | alpha=0.1 | 5 epochs | 200 rounds | drift schedule [100]
+Pipeline: GPU-resident dataset + GPU-side augmentation
+Batch size: 64 | drop_last=True | num_workers=0
+Downloading CIFAR-10...
+/usr/local/lib/python3.12/dist-packages/torchvision/datasets/cifar.py:83: VisibleDeprecationWarning: dtype(): align should be passed as Python or NumPy boolean but got `align=0`. Did you mean to pass a tuple to create a subarray type? (Deprecated NumPy 2.4)
+  entry = pickle.load(f, encoding="latin1")
+Partitioning...
+Samples/client: min=127 max=5338 mean=2500
+Pre-loading GPU-resident tensors...
+GPU-resident dataset memory: 703.6 MiB
+Model: CifarCNN | Params: 107,690
+
+[--rounds override] NUM_ROUNDS=200
+[--saile-init-lr] SAILE_INIT_LR = 0.01
+[--out-dir] CSVs will be written to: /home/suraf/runs/2026-06-11-saile-3seed/seed1//
+
+[--seed override] re-seeding to 1 and re-partitioning...
+  Re-partitioned: samples/client min=121 max=6775 mean=2500
+
+============================================================
+RUNNING METHODS: Saile
+Rounds per method: 200
+============================================================
+
+============================================================
+METHOD 6: Saile (per-client loss-EMA dynamic LR)
+  initial_lr=0.01 | lr_decay=0.99/round | b1=0.7 b2=0.3 b3=0.7
+  Decay brings base_lr from 0.01 to 0.0037 at round 100, 0.0014 at round 199.
+============================================================
+  Round 000 | Global: 0.1875 | per-client: 0.1875 | base_lr=0.00990 | lr min/mean/max=0.01000/0.01000/0.01000
+  Round 010 | Global: 0.5431 | per-client: 0.5431 | base_lr=0.00895 | lr min/mean/max=0.00641/0.00842/0.01000
+  Round 020 | Global: 0.6304 | per-client: 0.6304 | base_lr=0.00810 | lr min/mean/max=0.00614/0.00951/0.01000
+  Round 030 | Global: 0.6617 | per-client: 0.6617 | base_lr=0.00732 | lr min/mean/max=0.00544/0.00902/0.01000
+  Round 040 | Global: 0.6894 | per-client: 0.6894 | base_lr=0.00662 | lr min/mean/max=0.00518/0.00890/0.01000
+  Round 050 | Global: 0.6961 | per-client: 0.6961 | base_lr=0.00599 | lr min/mean/max=0.00586/0.00885/0.01000
+  Round 060 | Global: 0.7042 | per-client: 0.7042 | base_lr=0.00542 | lr min/mean/max=0.00512/0.00866/0.01000
+  Round 070 | Global: 0.7107 | per-client: 0.7107 | base_lr=0.00490 | lr min/mean/max=0.00471/0.00786/0.01000
+  Round 080 | Global: 0.7147 | per-client: 0.7147 | base_lr=0.00443 | lr min/mean/max=0.00445/0.00787/0.01000
+  Round 090 | Global: 0.7142 | per-client: 0.7142 | base_lr=0.00401 | lr min/mean/max=0.00336/0.00738/0.01000
+
+  *** Drift event 0 at round 100 ***
+  Group A [0, 1, 2, 10, 11, 12]: swap 1<->2
+  Group B [3, 4, 5, 13, 14, 15]: swap 3<->4
+  Group C [6, 7, 8, 9, 16, 17, 18, 19]: swap 5<->6
+  Round 100 | Global: 0.6479 | per-client: 0.5608 | base_lr=0.00362 | lr min/mean/max=0.00728/0.00967/0.01000  <-- DRIFT
+  Round 110 | Global: 0.6071 | per-client: 0.5610 | base_lr=0.00328 | lr min/mean/max=0.00263/0.00644/0.01000
+  Round 120 | Global: 0.6065 | per-client: 0.5617 | base_lr=0.00296 | lr min/mean/max=0.00215/0.00697/0.01000
+  Round 130 | Global: 0.6272 | per-client: 0.5670 | base_lr=0.00268 | lr min/mean/max=0.00291/0.00590/0.01000
+  Round 140 | Global: 0.6210 | per-client: 0.5686 | base_lr=0.00242 | lr min/mean/max=0.00237/0.00590/0.01000
+  Round 150 | Global: 0.6250 | per-client: 0.5651 | base_lr=0.00219 | lr min/mean/max=0.00168/0.00403/0.01000
+  Round 160 | Global: 0.6182 | per-client: 0.5651 | base_lr=0.00198 | lr min/mean/max=0.00125/0.00368/0.00904
+  Round 170 | Global: 0.5979 | per-client: 0.5594 | base_lr=0.00179 | lr min/mean/max=0.00164/0.00383/0.01000
+  Round 180 | Global: 0.6102 | per-client: 0.5638 | base_lr=0.00162 | lr min/mean/max=0.00162/0.00386/0.01000
+  Round 190 | Global: 0.6187 | per-client: 0.5633 | base_lr=0.00147 | lr min/mean/max=0.00092/0.00396/0.01000
+  Results: /home/suraf/runs/2026-06-11-saile-3seed/seed1/results_Saile.csv
+
+============================================================
+FINAL RESULTS SUMMARY
+============================================================
+
+Saile:
+  Pre-drift acc:     0.7138
+  Accuracy dip:      0.1110  (at first drift event, round 100)
+  Recovery rounds:   Not recovered
+  Post-drift stable: 0.6190
+  Per-event per-group local-acc dips (using local_cXX):
+    event   round     pre(A)     min(A)     dip(A)     pre(B)     min(B)     dip(B)     pre(C)     min(C)     dip(C)
+    0         100     0.7172     0.5916     0.1256     0.6329     0.4101     0.2228     0.7789     0.6495     0.1294
+
+Finished at: 2026-06-11 14:12:09
+Full output log: experiment_log_20260611_133509.txt
+CSV files saved per method (live):
+  - results_Saile.csv
