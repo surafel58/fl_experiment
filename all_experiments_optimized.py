@@ -1237,6 +1237,20 @@ def parse_args():
                         f"the default schedule {DRIFT_SCHEDULE_SINGLE} (single "
                         f"sudden-drift event) is used. Per-event swap mappings "
                         f"come from DRIFT_EVENTS.")
+    # Ablation knobs (OurMethod only). Affect only `TAU_OUR` and `DRIFT_LAYERS`,
+    # which together gate the single line at OurClient.train:
+    #     if name in DRIFT_LAYERS and ratio > TAU_OUR: flags[name] = True
+    # Nothing else in OurMethod's machinery (selective_sync, get_upload_state,
+    # per_layer_fedavg_our, classifier handling, EMA update) is changed.
+    p.add_argument('--ablation-tau', type=float, default=None,
+                   help=f"Override OurMethod's TAU_OUR (default {TAU_OUR}). "
+                        f"Pass `inf` to disable detection entirely (no layer "
+                        f"ever flags; OurMethod reduces to FedAvg-equivalent "
+                        f"aggregation through the existing selective-sync path).")
+    p.add_argument('--ablation-all-layers', action='store_true',
+                   help=f"Make all 4 hidden layers (L1, L2, L3, L4) eligible "
+                        f"for flagging instead of only L3+L4. The classifier "
+                        f"continues to be always-global, unchanged.")
     return p.parse_args()
 
 
@@ -1347,6 +1361,15 @@ if __name__ == '__main__':
     if args.recurrent:
         DRIFT_SCHEDULE[:] = DRIFT_SCHEDULE_RECURRENT
         print(f"[--recurrent] DRIFT_SCHEDULE = {DRIFT_SCHEDULE} (multi-event drift)")
+
+    if args.ablation_tau is not None:
+        TAU_OUR = args.ablation_tau
+        print(f"[--ablation-tau] TAU_OUR = {TAU_OUR}"
+              + (" (detection disabled — no layer will ever flag)"
+                 if TAU_OUR == float('inf') else ""))
+    if args.ablation_all_layers:
+        DRIFT_LAYERS = list(LAYER_GROUPS.keys())
+        print(f"[--ablation-all-layers] DRIFT_LAYERS = {DRIFT_LAYERS}")
 
     if args.out_dir is not None:
         OUT_DIR = args.out_dir
