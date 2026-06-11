@@ -811,6 +811,195 @@ ADAPTIVE_BETA3 = 0.7    # ratio EMA
 ADAPTIVE_INIT_LR = LR
 
 
+# ============================================================
+# Saile et al. 2024 (FLTA) — client-side loss-EMA dynamic LR.
+# Faithful port of src/algorithm/learningrate_estimator.py:LearningrateEstimatorLoss
+# (LR multiplier) and src/server/fedavgserver.py StepLR (server decay).
+#
+# Default hyperparameters are Saile's CIFAR-10 config (lr=0.2, lr_decay=0.99/round,
+# b1=0.7, b2=0.3, b3=0.7). Their initial LR is 20x our LR=0.01 - we treat Saile
+# as its own method with its own LR (same protocol used for AdaptiveFedAvg fix),
+# and SAILE_INIT_LR is overridable via --saile-init-lr for the FedDrift-style
+# LR sweep over Saile's recommended LRs.
+# ============================================================
+SAILE_B1            = 0.7
+SAILE_B2            = 0.3
+SAILE_B3            = 0.7
+SAILE_INIT_LR       = 0.2           # Saile CIFAR-10 default; override via --saile-init-lr
+SAILE_LR_DECAY      = 0.99          # multiplicative server-side per-round decay
+SAILE_PROBE_BUDGET  = 50            # Saile's `while batch_count <= 50` in update_estimator
+
+
+class SaileEstimator:
+    """Faithful port of LearningrateEstimatorLoss (Saile et al. 2024).
+
+    One instance per client. estimate(loss, current_round, base_lr) returns
+    that client's LR for this round = min(initial_lr, base_lr * R_hat) where
+    R_hat is the third (bias-corrected) EMA of the variance ratio of the loss.
+
+    Mirrors src/algorithm/learningrate_estimator.py:77-128. Including the V=0
+    edge case at line 109-113 (paper Algorithm 2 lines 5-6).
+    """
+    def __init__(self, initial_lr, b1, b2, b3):
+        self.initial_lr = initial_lr
+        self.b1, self.b2, self.b3 = b1, b2, b3
+        self.loss_ema = 0.0
+        self.prev_loss_ema = 0.0
+        self.prev_loss_ema_na = 0.0
+        self.variance_ema = 0.0
+        self.prev_variance_ema = 0.0
+        self.prev_variance_ema_na = 0.0
+        self.variance_ratio_ema = 0.0
+        self.prev_variance_ratio_ema_na = 0.0
+
+    def estimate(self, loss, current_round, base_lr):
+        # EMA on loss mean + bias correction
+        self.loss_ema = self.b1 * self.prev_loss_ema_na + (1 - self.b1) * loss
+        self.prev_loss_ema_na = self.loss_ema
+        self.loss_ema = self.loss_ema / (1 - pow(self.b1, current_round))
+
+        # EMA on loss variance + bias correction
+        self.variance_ema = (self.b2 * self.prev_variance_ema_na
+                             + (1 - self.b2) * (loss - self.prev_loss_ema) ** 2)
+        self.prev_variance_ema_na = self.variance_ema
+        self.variance_ema = self.variance_ema / (1 - pow(self.b2, current_round))
+
+        # V=0 edge case (paper Algorithm 2 lines 5-6, Saile code lines 109-113)
+        if self.prev_variance_ema == 0:
+            ratio = 1.0
+        else:
+            ratio = self.variance_ema / self.prev_variance_ema
+
+        # EMA on variance ratio + bias correction
+        self.variance_ratio_ema = (self.b3 * self.prev_variance_ratio_ema_na
+                                   + (1 - self.b3) * ratio)
+        self.prev_variance_ratio_ema_na = self.variance_ratio_ema
+        self.variance_ratio_ema = self.variance_ratio_ema / (1 - pow(self.b3, current_round))
+
+        # Snapshot for next call's ratio computation
+        self.prev_loss_ema = self.loss_ema
+        self.prev_variance_ema = self.variance_ema
+
+        return float(min(self.initial_lr, base_lr * self.variance_ratio_ema))
+
+
+def _saile_probe_loss(model, x, y,
+                      probe_budget=SAILE_PROBE_BUDGET, batch_size=BATCH_SIZE):
+    """Mean cross-entropy of the GLOBAL model on a random subset of (x, y).
+
+    Mirrors src/client/fedavgclient.py:79-101 update_estimator(): a
+    `while batch_count <= probe_budget` loop sampling random batches and
+    averaging the per-batch loss. No grad. With our BATCH_SIZE=64 and the
+    default probe_budget=50, one batch fires (~64 samples) — equivalent to
+    Saile's behavior at B=50 (two batches ~100 samples).
+    """
+    n = x.size(0)
+    if n == 0:
+        return 0.0
+    crit = nn.CrossEntropyLoss()
+    model.eval()
+    losses = []
+    batch_count = 0
+    with torch.no_grad():
+        while batch_count <= probe_budget:
+            idx = torch.randperm(n, device=x.device)[:batch_size]
+            losses.append(crit(model(x[idx]), y[idx]).item())
+            batch_count += batch_size
+    return float(np.mean(losses))
+
+
+def run_saile():
+    """METHOD 6: Saile et al. 2024 (FLTA), client-side loss-EMA dynamic LR.
+
+    Each round (faithful to Saile's flow):
+      1. Server broadcasts the global model gm.
+      2. Each client computes a loss probe on gm (~SAILE_PROBE_BUDGET samples,
+         no grad).
+      3. Each client's SaileEstimator updates 3 EMAs (loss, loss-variance,
+         variance-ratio) + bias correction + V=0 edge case, returning a
+         per-client LR = min(SAILE_INIT_LR, base_lr * R_hat).
+      4. Each client trains locally at its OWN LR for LOCAL_EPOCHS.
+      5. FedAvg aggregate.
+      6. Server applies stepwise decay: base_lr <- base_lr * SAILE_LR_DECAY.
+
+    Hyperparameters are Saile's CIFAR-10 defaults by default. The init LR is
+    overridable via --saile-init-lr for FedDrift-style LR sweeps.
+    """
+    print("\n" + "="*60)
+    print(f"METHOD 6: Saile (per-client loss-EMA dynamic LR)")
+    print(f"  initial_lr={SAILE_INIT_LR} | lr_decay={SAILE_LR_DECAY}/round | "
+          f"b1={SAILE_B1} b2={SAILE_B2} b3={SAILE_B3}")
+    print(f"  Decay brings base_lr from {SAILE_INIT_LR} to "
+          f"{SAILE_INIT_LR * SAILE_LR_DECAY**100:.4f} at round 100, "
+          f"{SAILE_INIT_LR * SAILE_LR_DECAY**199:.4f} at round 199.")
+    print("="*60)
+
+    client_y   = fresh_client_y()
+    gm         = get_model()
+    reset_per_client_metric_state()
+    estimators = [SaileEstimator(SAILE_INIT_LR, SAILE_B1, SAILE_B2, SAILE_B3)
+                  for _ in range(NUM_CLIENTS)]
+    base_lr    = SAILE_INIT_LR
+    log        = []
+    csv_out    = LiveCSV(seeded_path('results_Saile.csv'),
+                         ['round', 'global_acc', 'per_client_gen_acc',
+                          'base_lr', 'mean_client_lr',
+                          'min_client_lr', 'max_client_lr'] + CLIENT_FIELDS)
+
+    try:
+        for rnd in range(NUM_ROUNDS):
+            if rnd in DRIFT_SCHEDULE:
+                apply_drift_event(client_y, DRIFT_SCHEDULE.index(rnd))
+
+            # Loss probe + per-client LR on the BROADCAST global model gm.
+            # current_round is 1-indexed (Saile's framework rounds start at 1,
+            # avoids divide-by-zero in 1 - b^0).
+            client_lrs = []
+            for cid in range(NUM_CLIENTS):
+                loss = _saile_probe_loss(gm, GPU_CLIENT_X[cid], client_y[cid])
+                lr_c = estimators[cid].estimate(loss, rnd + 1, base_lr)
+                client_lrs.append(lr_c)
+
+            # Local training at each client's individual LR.
+            states, weights = [], []
+            for cid in range(NUM_CLIENTS):
+                lm = get_model()
+                lm.load_state_dict({k: v.clone() for k, v in gm.state_dict().items()})
+                local_train_gpu(lm, GPU_CLIENT_X[cid], client_y[cid], lr=client_lrs[cid])
+                states.append(lm.state_dict())
+                weights.append(CLIENT_WEIGHTS[cid])
+
+            fedavg_aggregate(gm, states, weights)
+
+            # Server-side stepwise decay (after aggregation, before next round).
+            base_lr = base_lr * SAILE_LR_DECAY
+
+            acc        = evaluate_gpu(gm)
+            pc_acc     = evaluate_per_client_gen_acc(gm)
+            local_accs = evaluate_all_clients(gm, client_y)
+            row = build_local_row(rnd, acc, local_accs, extra={
+                'per_client_gen_acc': pc_acc,
+                'base_lr':            base_lr,
+                'mean_client_lr':     float(np.mean(client_lrs)),
+                'min_client_lr':      float(np.min(client_lrs)),
+                'max_client_lr':      float(np.max(client_lrs)),
+            })
+            log.append(row)
+            csv_out.write(row)
+
+            if rnd % 10 == 0 or rnd in DRIFT_SCHEDULE:
+                tag = "  <-- DRIFT" if rnd in DRIFT_SCHEDULE else ""
+                print(f"  Round {rnd:03d} | Global: {acc:.4f} | "
+                      f"per-client: {pc_acc:.4f} | base_lr={base_lr:.5f} | "
+                      f"lr min/mean/max="
+                      f"{min(client_lrs):.5f}/{np.mean(client_lrs):.5f}/"
+                      f"{max(client_lrs):.5f}{tag}")
+    finally:
+        csv_out.close()
+    print(f"  Results: {csv_out.path}")
+    return log
+
+
 def run_adaptive_fedavg():
     print("\n" + "="*60)
     print("METHOD 3: Adaptive-FedAvg (Canonji 2021, ported from FedCCFA)")
@@ -1404,6 +1593,7 @@ METHOD_REGISTRY = {
     3: ('AdaptiveFedAvg',  run_adaptive_fedavg),
     4: ('OurMethod',       run_our_method),
     5: ('FedAvgPlus1',     run_fedavg_plus1),   # control: FedAvg + 1 local epoch for per-client eval only
+    6: ('Saile',           run_saile),          # Saile 2024 (FLTA): per-client loss-EMA dynamic LR
 }
 
 
@@ -1417,13 +1607,14 @@ def parse_args():
                 "  3  AdaptiveFedAvg\n"
                 "  4  OurMethod\n"
                 "  5  FedAvgPlus1 (control: FedAvg + 1 local epoch for per-client eval only)\n"
+                "  6  Saile (2024 FLTA: per-client loss-EMA dynamic LR)\n"
                 "\nExamples:\n"
                 "  python3 all_experiments_optimized.py\n"
                 "  python3 all_experiments_optimized.py --methods 1\n"
                 "  python3 all_experiments_optimized.py --methods 1 2 4\n"
                 "  python3 all_experiments_optimized.py --methods all\n"))
     p.add_argument('--methods', nargs='+', default=['all'],
-                   help="Method IDs (1..5) or 'all' (default; methods 1..5 only).")
+                   help="Method IDs (1..6) or 'all' (default; methods 1..6 only).")
     p.add_argument('--rounds', type=int, default=None,
                    help=f"Override total rounds (default {NUM_ROUNDS}). "
                         f"For smoke tests, use a small value like 10.")
@@ -1461,6 +1652,11 @@ def parse_args():
                         f"only. Other methods continue to use LR={LR}. Used for "
                         f"the FedDrift-style LR sweep on AdaptiveFedAvg (its "
                         f"internal scheduler needs its own LR selected).")
+    p.add_argument('--saile-init-lr', type=float, default=None,
+                   help=f"Override the initial LR for Saile (method 6) only. "
+                        f"Default is Saile's CIFAR-10 LR={SAILE_INIT_LR}. Used "
+                        f"for the FedDrift-style LR sweep (Saile has its own "
+                        f"internal LR scheduler so it needs its own LR selected).")
     return p.parse_args()
 
 
@@ -1473,9 +1669,9 @@ def resolve_methods(arg_list):
             n = int(a)
         except ValueError:
             raise SystemExit(f"Unknown --methods value: {a!r}. "
-                             f"Use 1..5 or 'all'.")
+                             f"Use 1..6 or 'all'.")
         if n not in METHOD_REGISTRY:
-            raise SystemExit(f"Unknown method id: {n}. Valid: 1..5")
+            raise SystemExit(f"Unknown method id: {n}. Valid: 1..6")
         if n not in out:
             out.append(n)
     return out
@@ -1584,6 +1780,10 @@ if __name__ == '__main__':
     if args.adaptive_init_lr is not None:
         ADAPTIVE_INIT_LR = args.adaptive_init_lr
         print(f"[--adaptive-init-lr] ADAPTIVE_INIT_LR = {ADAPTIVE_INIT_LR}")
+
+    if args.saile_init_lr is not None:
+        SAILE_INIT_LR = args.saile_init_lr
+        print(f"[--saile-init-lr] SAILE_INIT_LR = {SAILE_INIT_LR}")
 
     if args.out_dir is not None:
         OUT_DIR = args.out_dir

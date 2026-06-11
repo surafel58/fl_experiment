@@ -1,0 +1,9 @@
+[sweep] start at Thu Jun 11 12:11:27 UTC 2026
+[sweep] launching lr=0.2 (tag 0p2) at Thu Jun 11 12:11:27 UTC 2026
+[sweep] launching lr=0.1 (tag 0p1) at Thu Jun 11 12:11:30 UTC 2026
+[sweep] pair 1 PIDs: 1507 1514 
+[sweep] pair 1 done at Thu Jun 11 12:49:05 UTC 2026
+[sweep] launching lr=0.01 (tag 0p01) at Thu Jun 11 12:49:05 UTC 2026
+[sweep] pair 2 PID: 2322 
+[sweep] pair 2 done at Thu Jun 11 13:23:38 UTC 2026
+[sweep] ALL DONE at Thu Jun 11 13:23:38 UTC 2026
