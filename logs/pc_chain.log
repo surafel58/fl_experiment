@@ -1,0 +1,9 @@
+[chain] Waiting for B1 (methods 1 and 5) to finish...
+[chain] B1 done at Mon Jun  8 15:40:56 UTC 2026.
+[chain] Launching B2 (methods 2 + 3)...
+[chain] B2 launched at Mon Jun  8 15:40:58 UTC 2026. PIDs: 10756 10761 
+[chain] B2 done at Mon Jun  8 16:20:29 UTC 2026.
+[chain] Launching B3 (method 4)...
+[chain] B3 launched at Mon Jun  8 16:20:29 UTC 2026.
+[chain] B3 done at Mon Jun  8 16:55:00 UTC 2026.
+[chain] ALL_DONE marker written at Mon Jun  8 16:55:00 UTC 2026.

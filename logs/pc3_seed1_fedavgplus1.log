@@ -1,0 +1,78 @@
+============================================================
+Experiment log: experiment_log_20260609_032844.txt
+Started at: 2026-06-09 03:28:44
+============================================================
+Device: cuda
+CPU cores detected: 4
+Config: 20 clients | alpha=0.1 | 5 epochs | 200 rounds | drift schedule [100]
+Pipeline: GPU-resident dataset + GPU-side augmentation
+Batch size: 64 | drop_last=True | num_workers=0
+Downloading CIFAR-10...
+/usr/local/lib/python3.12/dist-packages/torchvision/datasets/cifar.py:83: VisibleDeprecationWarning: dtype(): align should be passed as Python or NumPy boolean but got `align=0`. Did you mean to pass a tuple to create a subarray type? (Deprecated NumPy 2.4)
+  entry = pickle.load(f, encoding="latin1")
+Partitioning...
+Samples/client: min=127 max=5338 mean=2500
+Pre-loading GPU-resident tensors...
+GPU-resident dataset memory: 703.6 MiB
+Model: CifarCNN | Params: 107,690
+
+[--rounds override] NUM_ROUNDS=200
+[--out-dir] CSVs will be written to: runs/2026-06-08-perclient-3seed/seed1/fedavgplus1//
+
+[--seed override] re-seeding to 1 and re-partitioning...
+  Re-partitioned: samples/client min=121 max=6775 mean=2500
+
+============================================================
+RUNNING METHODS: FedAvgPlus1
+Rounds per method: 200
+============================================================
+
+============================================================
+METHOD 5 (control): FedAvg + 1 local epoch
+  global eval     -> global aggregated model, canonical TEST_Y
+  per-client eval -> each client's (global + 1 local epoch) model
+============================================================
+  Round 000 | Global: 0.2159 | per-client(finetuned): 0.1623 | mean local: 0.2109
+  Round 010 | Global: 0.5718 | per-client(finetuned): 0.3450 | mean local: 0.5295
+  Round 020 | Global: 0.6379 | per-client(finetuned): 0.4169 | mean local: 0.6005
+  Round 030 | Global: 0.6736 | per-client(finetuned): 0.4495 | mean local: 0.6455
+  Round 040 | Global: 0.6931 | per-client(finetuned): 0.4725 | mean local: 0.6765
+  Round 050 | Global: 0.7009 | per-client(finetuned): 0.4832 | mean local: 0.6843
+  Round 060 | Global: 0.7079 | per-client(finetuned): 0.4985 | mean local: 0.6957
+  Round 070 | Global: 0.7065 | per-client(finetuned): 0.5105 | mean local: 0.6933
+  Round 080 | Global: 0.7130 | per-client(finetuned): 0.5175 | mean local: 0.7116
+  Round 090 | Global: 0.7089 | per-client(finetuned): 0.5215 | mean local: 0.7012
+
+  *** Drift event 0 at round 100 ***
+  Group A [0, 1, 2, 10, 11, 12]: swap 1<->2
+  Group B [3, 4, 5, 13, 14, 15]: swap 3<->4
+  Group C [6, 7, 8, 9, 16, 17, 18, 19]: swap 5<->6
+  Round 100 | Global: 0.6365 | per-client(finetuned): 0.4331 | mean local: 0.5819  <-- DRIFT
+  Round 110 | Global: 0.6225 | per-client(finetuned): 0.4557 | mean local: 0.5895
+  Round 120 | Global: 0.6130 | per-client(finetuned): 0.4571 | mean local: 0.5924
+  Round 130 | Global: 0.6175 | per-client(finetuned): 0.4570 | mean local: 0.5969
+  Round 140 | Global: 0.6151 | per-client(finetuned): 0.4633 | mean local: 0.5963
+  Round 150 | Global: 0.6226 | per-client(finetuned): 0.4699 | mean local: 0.6015
+  Round 160 | Global: 0.6237 | per-client(finetuned): 0.4712 | mean local: 0.6003
+  Round 170 | Global: 0.6154 | per-client(finetuned): 0.4680 | mean local: 0.5995
+  Round 180 | Global: 0.6219 | per-client(finetuned): 0.4679 | mean local: 0.6004
+  Round 190 | Global: 0.6258 | per-client(finetuned): 0.4709 | mean local: 0.6013
+  Results: runs/2026-06-08-perclient-3seed/seed1/fedavgplus1/results_FedAvgPlus1.csv
+
+============================================================
+FINAL RESULTS SUMMARY
+============================================================
+
+FedAvgPlus1:
+  Pre-drift acc:     0.7138
+  Accuracy dip:      0.0980  (at first drift event, round 100)
+  Recovery rounds:   Not recovered
+  Post-drift stable: 0.6223
+  Per-event per-group local-acc dips (using local_cXX):
+    event   round     pre(A)     min(A)     dip(A)     pre(B)     min(B)     dip(B)     pre(C)     min(C)     dip(C)
+    0         100     0.7058     0.6025     0.1033     0.6337     0.4100     0.2237     0.7750     0.6553     0.1197
+
+Finished at: 2026-06-09 04:13:45
+Full output log: experiment_log_20260609_032844.txt
+CSV files saved per method (live):
+  - results_FedAvgPlus1.csv
