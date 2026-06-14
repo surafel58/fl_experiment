@@ -133,6 +133,15 @@ DRIFT_GROUP_B  = [i for i in range(NUM_CLIENTS) if 3 <= i % 10 < 6]
 DRIFT_GROUP_C  = [i for i in range(NUM_CLIENTS) if i % 10 >= 6]
 DRIFT_GROUPS   = {'A': DRIFT_GROUP_A, 'B': DRIFT_GROUP_B, 'C': DRIFT_GROUP_C}
 
+# Aggressive-concept-drift mode (opt-in via --aggressive-concept-drift):
+# When this dict is not None, apply_drift_event uses per-cohort FULL label
+# permutations (10! space) instead of pairwise swaps. Set in __main__ to:
+#   {'A': perm_tensor_A, 'B': perm_tensor_B, 'C': perm_tensor_C}
+# where each perm_tensor is a torch.long tensor on DEVICE such that the new
+# label for old label i is perm_tensor[i]. apply_test_drift_event uses the
+# same dict in lockstep so the per-client metric stays consistent.
+AGGRESSIVE_PERMUTATIONS = None
+
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 random.seed(SEED)
@@ -244,7 +253,19 @@ def apply_test_drift_event(event_idx):
     """Mutate TEST_Y_VARIANTS[1..3] and CLIENT_GLOBAL_TEST_ID for the event.
     Called from apply_drift_event so the test-set swaps stay in lockstep with
     the per-client training-label swaps. TEST_Y_VARIANTS[0] is never mutated.
+
+    When AGGRESSIVE_PERMUTATIONS is set (--aggressive-concept-drift), uses the
+    per-cohort full permutation on each TEST_Y_VARIANTS[gid] instead of a
+    pairwise swap. Same gid assignment per cohort either way.
     """
+    if AGGRESSIVE_PERMUTATIONS is not None:
+        for group_label, group_clients in DRIFT_GROUPS.items():
+            perm = AGGRESSIVE_PERMUTATIONS[group_label]
+            gid  = GROUP_TO_GID[group_label]
+            _permute_labels_gpu(TEST_Y_VARIANTS[gid], perm)
+            for cid in group_clients:
+                CLIENT_GLOBAL_TEST_ID[cid] = gid
+        return
     swaps = DRIFT_EVENTS[event_idx]
     for group_label, group_clients in DRIFT_GROUPS.items():
         a, b = swaps[group_label]
@@ -314,6 +335,16 @@ def _swap_labels_gpu(y, a, b):
     y[mask_b] = a
 
 
+def _permute_labels_gpu(y, perm_tensor):
+    """Apply a full label permutation in-place.
+    perm_tensor[i] = new label for old label i (shape [num_classes], dtype long, on DEVICE).
+    Uses out-of-place gather + copy_ to avoid cascading-update corruption that
+    would occur if we mutated y in place during the lookup.
+    """
+    new_y = perm_tensor[y]
+    y.copy_(new_y)
+
+
 def apply_drift_event(client_y, event_idx):
     """
     Apply the swap mapping of DRIFT_EVENTS[event_idx] in-place on the per-method
@@ -328,9 +359,20 @@ def apply_drift_event(client_y, event_idx):
     metric ARE mutated here via apply_test_drift_event, so the per-cohort test
     swaps stay in lockstep with the per-client training-label swaps.
     """
-    swaps = DRIFT_EVENTS[event_idx]
-    rnd   = DRIFT_SCHEDULE[event_idx]
+    rnd = DRIFT_SCHEDULE[event_idx]
     print(f"\n  *** Drift event {event_idx} at round {rnd} ***")
+    if AGGRESSIVE_PERMUTATIONS is not None:
+        # Per-cohort full-permutation mode (--aggressive-concept-drift).
+        # Each cohort applies a DIFFERENT 10-label permutation, maximizing
+        # inter-cohort conflict on the shared model.
+        for group_label, group_clients in DRIFT_GROUPS.items():
+            perm = AGGRESSIVE_PERMUTATIONS[group_label]
+            print(f"  Group {group_label} {group_clients}: perm = {perm.tolist()}")
+            for cid in group_clients:
+                _permute_labels_gpu(client_y[cid], perm)
+        apply_test_drift_event(event_idx)
+        return
+    swaps = DRIFT_EVENTS[event_idx]
     for group_label, group_clients in DRIFT_GROUPS.items():
         a, b = swaps[group_label]
         print(f"  Group {group_label} {group_clients}: swap {a}<->{b}")
@@ -1671,6 +1713,13 @@ def parse_args():
                         f"partition (default {ALPHA_DIR}). Smaller alpha is "
                         f"more non-IID; alpha=0.5 is moderately non-IID. "
                         f"Triggers re-partitioning of the train set.")
+    p.add_argument('--aggressive-concept-drift', action='store_true',
+                   help="Single sudden drift at round 100 where each cohort "
+                        "applies a DIFFERENT, full 10-label permutation (not a "
+                        "pairwise swap). Permutations are seeded (RandomState 42) "
+                        "for reproducibility. Maximizes inter-cohort conflict on "
+                        "the shared feature representation. Overrides the default "
+                        "pairwise-swap drift table.")
     return p.parse_args()
 
 
@@ -1825,6 +1874,39 @@ if __name__ == '__main__':
         ALPHA_DIR = args.alpha_dir
         print(f"\n[--alpha-dir override] ALPHA_DIR = {ALPHA_DIR}")
         repartition_needed = True
+
+    if args.aggressive_concept_drift:
+        # Single sudden drift at round 100 with per-cohort FULL label
+        # permutations. Seeded with RandomState(42) for reproducibility.
+        DRIFT_SCHEDULE[:] = [100]
+        # Generate 3 fixed, maximally-different label permutations.
+        _rng = np.random.RandomState(42)
+        _p_A = _rng.permutation(10).astype(np.int64)
+        _p_B = _rng.permutation(10).astype(np.int64)
+        _p_C = _rng.permutation(10).astype(np.int64)
+        AGGRESSIVE_PERMUTATIONS = {
+            'A': torch.from_numpy(_p_A).to(DEVICE),
+            'B': torch.from_numpy(_p_B).to(DEVICE),
+            'C': torch.from_numpy(_p_C).to(DEVICE),
+        }
+        # Report the permutations + cross-cohort agreement counts so the
+        # "maximally different" property is auditable from the log.
+        print(f"\n[--aggressive-concept-drift] DRIFT_SCHEDULE = {DRIFT_SCHEDULE} "
+              f"(single sudden drift, per-cohort FULL permutation)")
+        print(f"  P_A: {_p_A.tolist()}")
+        print(f"  P_B: {_p_B.tolist()}")
+        print(f"  P_C: {_p_C.tolist()}")
+        agree_AB = int((_p_A == _p_B).sum())
+        agree_BC = int((_p_B == _p_C).sum())
+        agree_AC = int((_p_A == _p_C).sum())
+        agree_id_A = int((_p_A == np.arange(10)).sum())
+        agree_id_B = int((_p_B == np.arange(10)).sum())
+        agree_id_C = int((_p_C == np.arange(10)).sum())
+        print(f"  Cross-cohort agreements (out of 10): "
+              f"P_A vs P_B = {agree_AB}, P_B vs P_C = {agree_BC}, "
+              f"P_A vs P_C = {agree_AC}")
+        print(f"  Fixed points (label kept unchanged): "
+              f"P_A = {agree_id_A}, P_B = {agree_id_B}, P_C = {agree_id_C}")
     if args.seed is not None and args.seed != SEED:
         print(f"\n[--seed override] re-seeding to {args.seed}")
         SEED = args.seed
