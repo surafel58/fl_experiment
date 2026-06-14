@@ -1633,6 +1633,15 @@ def parse_args():
                         f"the default schedule {DRIFT_SCHEDULE_SINGLE} (single "
                         f"sudden-drift event) is used. Per-event swap mappings "
                         f"come from DRIFT_EVENTS.")
+    p.add_argument('--alternating-drift', action='store_true',
+                   help="Frequent ALTERNATING drift: schedule [40, 80, 120, 160] "
+                        "with the SAME cohort swap (A:1<->2, B:3<->4, C:5<->6) "
+                        "applied at every event. Because _swap_labels_gpu is an "
+                        "involution, applying the same swap twice toggles labels "
+                        "back to canonical. So the concept oscillates: "
+                        "canonical -> swapped -> canonical -> swapped -> canonical. "
+                        "Used for recurrent-gain analysis (forgetting + accuracy "
+                        "across recurring concepts). Overrides --recurrent.")
     # Ablation knobs (OurMethod only). Affect only `TAU_OUR` and `DRIFT_LAYERS`,
     # which together gate the single line at OurClient.train:
     #     if name in DRIFT_LAYERS and ratio > TAU_OUR: flags[name] = True
@@ -1772,6 +1781,20 @@ if __name__ == '__main__':
     if args.recurrent:
         DRIFT_SCHEDULE[:] = DRIFT_SCHEDULE_RECURRENT
         print(f"[--recurrent] DRIFT_SCHEDULE = {DRIFT_SCHEDULE} (multi-event drift)")
+
+    if args.alternating_drift:
+        # Frequent alternating drift: same cohort swap applied at every event.
+        # _swap_labels_gpu is an involution -> two consecutive applications cancel,
+        # producing canonical -> swapped -> canonical -> swapped -> canonical.
+        # Overrides --recurrent if both were passed.
+        DRIFT_SCHEDULE[:] = [40, 80, 120, 160]
+        DRIFT_EVENTS.clear()
+        for _ in range(len(DRIFT_SCHEDULE)):
+            DRIFT_EVENTS.append({'A': (1, 2), 'B': (3, 4), 'C': (5, 6)})
+        print(f"[--alternating-drift] DRIFT_SCHEDULE = {DRIFT_SCHEDULE}")
+        print(f"[--alternating-drift] DRIFT_EVENTS = {len(DRIFT_EVENTS)} x "
+              f"{DRIFT_EVENTS[0]} (involution -> concept oscillates "
+              f"canonical/swapped/canonical/swapped/canonical)")
 
     if args.ablation_tau is not None:
         TAU_OUR = args.ablation_tau
