@@ -1763,6 +1763,15 @@ def parse_args():
                    help=f"Make all 4 hidden layers (L1, L2, L3, L4) eligible "
                         f"for flagging instead of only L3+L4. The classifier "
                         f"continues to be always-global, unchanged.")
+    p.add_argument('--drift-layers', nargs='+', default=None,
+                   choices=['layer1', 'layer2', 'layer3', 'layer4'],
+                   help="Override OurMethod's flaggable-layer set explicitly. "
+                        "Default is ['layer3','layer4']. Pass e.g. 'layer1 layer2' "
+                        "to re-aim the detector at early conv layers (surgical "
+                        "fine-tuning theory: covariate / input shift disturbs "
+                        "early layers, label shift disturbs late layers). "
+                        "Only affects OurMethod (method 4). Takes precedence "
+                        "over --ablation-all-layers if both are passed.")
     p.add_argument('--adaptive-init-lr', type=float, default=None,
                    help=f"Override the initial LR for AdaptiveFedAvg (method 3) "
                         f"only. Other methods continue to use LR={LR}. Used for "
@@ -1918,6 +1927,13 @@ if __name__ == '__main__':
     if args.ablation_all_layers:
         DRIFT_LAYERS = list(LAYER_GROUPS.keys())
         print(f"[--ablation-all-layers] DRIFT_LAYERS = {DRIFT_LAYERS}")
+
+    if args.drift_layers is not None:
+        # Explicit DRIFT_LAYERS override. Takes precedence over
+        # --ablation-all-layers (we put this block AFTER it). Only affects
+        # OurMethod's flag-decision in OurClient.train; nothing else.
+        DRIFT_LAYERS = list(args.drift_layers)
+        print(f"[--drift-layers] OurMethod DRIFT_LAYERS = {DRIFT_LAYERS}")
 
     if args.adaptive_init_lr is not None:
         ADAPTIVE_INIT_LR = args.adaptive_init_lr
