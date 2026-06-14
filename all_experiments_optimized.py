@@ -1657,6 +1657,11 @@ def parse_args():
                         f"Default is Saile's CIFAR-10 LR={SAILE_INIT_LR}. Used "
                         f"for the FedDrift-style LR sweep (Saile has its own "
                         f"internal LR scheduler so it needs its own LR selected).")
+    p.add_argument('--alpha-dir', type=float, default=None,
+                   help=f"Override the Dirichlet alpha for the per-client "
+                        f"partition (default {ALPHA_DIR}). Smaller alpha is "
+                        f"more non-IID; alpha=0.5 is moderately non-IID. "
+                        f"Triggers re-partitioning of the train set.")
     return p.parse_args()
 
 
@@ -1790,15 +1795,24 @@ if __name__ == '__main__':
         os.makedirs(OUT_DIR, exist_ok=True)
         print(f"[--out-dir] CSVs will be written to: {OUT_DIR}/")
 
+    # Both --seed and --alpha-dir trigger re-partitioning (single pass at the end
+    # with whichever values are now in effect).
+    repartition_needed = False
+    if args.alpha_dir is not None and args.alpha_dir != ALPHA_DIR:
+        ALPHA_DIR = args.alpha_dir
+        print(f"\n[--alpha-dir override] ALPHA_DIR = {ALPHA_DIR}")
+        repartition_needed = True
     if args.seed is not None and args.seed != SEED:
-        print(f"\n[--seed override] re-seeding to {args.seed} and re-partitioning...")
+        print(f"\n[--seed override] re-seeding to {args.seed}")
         SEED = args.seed
         torch.manual_seed(SEED)
         np.random.seed(SEED)
         random.seed(SEED)
         if torch.cuda.is_available():
             torch.backends.cudnn.benchmark = True
-        # Re-partition with the new seed
+        repartition_needed = True
+    if repartition_needed:
+        print(f"[re-partition] alpha={ALPHA_DIR}, seed={SEED}")
         train_idx = partition_dataset(raw_train, NUM_CLIENTS, ALPHA_DIR, SEED)
         # Rebuild GPU-resident tensors (x is also re-built since partition changed)
         GPU_CLIENT_X.clear()
