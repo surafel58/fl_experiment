@@ -245,6 +245,19 @@ def apply_test_drift_event(event_idx):
     Called from apply_drift_event so the test-set swaps stay in lockstep with
     the per-client training-label swaps. TEST_Y_VARIANTS[0] is never mutated.
     """
+    if COVARIATE_CORRUPTIONS is not None:
+        # Per-cohort image corruption applied to TEST_X_VARIANTS[1..3]; labels
+        # untouched. Seed uses gid + a fixed offset so each variant gets a
+        # deterministic but distinct noise realization (matters for gauss_noise).
+        for group_label, group_clients in DRIFT_GROUPS.items():
+            kind = COVARIATE_CORRUPTIONS[group_label]
+            fn   = COVARIATE_KIND_FN[kind]
+            gid  = GROUP_TO_GID[group_label]
+            new_x = fn(TEST_X_VARIANTS[gid], seed=4242 + gid)
+            TEST_X_VARIANTS[gid].copy_(new_x)
+            for cid in group_clients:
+                CLIENT_GLOBAL_TEST_ID[cid] = gid
+        return
     swaps = DRIFT_EVENTS[event_idx]
     for group_label, group_clients in DRIFT_GROUPS.items():
         a, b = swaps[group_label]
@@ -256,9 +269,14 @@ def apply_test_drift_event(event_idx):
 
 def reset_per_client_metric_state():
     """Restore pre-drift test-set state. Called at the start of each method
-    run so cross-method drift mutations don't leak."""
+    run so cross-method drift mutations don't leak.
+    Also restores TEST_X_VARIANTS to canonical TEST_X if covariate-drift mode
+    is active (the per-cohort image variants get mutated by apply_test_drift_event)."""
     for gid in TEST_Y_VARIANTS:
         TEST_Y_VARIANTS[gid].copy_(TEST_Y)
+    if TEST_X_VARIANTS is not None:
+        for gid in TEST_X_VARIANTS:
+            TEST_X_VARIANTS[gid].copy_(TEST_X)
     for cid in range(NUM_CLIENTS):
         CLIENT_GLOBAL_TEST_ID[cid] = 0
 
@@ -277,8 +295,14 @@ def evaluate_per_client_gen_acc(model):
     sum(N copies of x)/N round-trip and its associated ULP rounding).
     """
     needed = set(CLIENT_GLOBAL_TEST_ID)
-    acc_by_gid = {gid: evaluate_gpu(model, TEST_X, TEST_Y_VARIANTS[gid])
-                  for gid in needed}
+    if TEST_X_VARIANTS is not None:
+        # Covariate-drift mode: per-cohort corrupted IMAGES, canonical labels.
+        acc_by_gid = {gid: evaluate_gpu(model, TEST_X_VARIANTS[gid], TEST_Y)
+                      for gid in needed}
+    else:
+        # Label-drift mode: shared canonical IMAGES, per-cohort corrupted labels.
+        acc_by_gid = {gid: evaluate_gpu(model, TEST_X, TEST_Y_VARIANTS[gid])
+                      for gid in needed}
     if len(needed) == 1:
         return next(iter(acc_by_gid.values()))
     cohort_sizes = {gid: 0 for gid in needed}
@@ -295,7 +319,14 @@ print(f"GPU-resident dataset memory: {_resident_mb:.1f} MiB")
 
 
 def fresh_client_y():
-    """Per-method working copy of client labels (so drift doesn't leak)."""
+    """Per-method working copy of client labels (so drift doesn't leak).
+    In covariate-drift mode, also restores GPU_CLIENT_X to its canonical
+    pre-drift state (apply_drift_event in that mode mutates GPU_CLIENT_X
+    in place). No-op when GPU_CLIENT_X_CANONICAL is None (default mode).
+    """
+    if GPU_CLIENT_X_CANONICAL is not None:
+        for cid in range(NUM_CLIENTS):
+            GPU_CLIENT_X[cid].copy_(GPU_CLIENT_X_CANONICAL[cid])
     return {cid: GPU_CLIENT_Y_CLEAN[cid].clone() for cid in range(NUM_CLIENTS)}
 
 
@@ -314,6 +345,68 @@ def _swap_labels_gpu(y, a, b):
     y[mask_b] = a
 
 
+# ============================================================
+# COVARIATE DRIFT helpers (opt-in via --covariate-drift).
+#
+# Per-cohort image corruptions applied to IMAGES (X tensors), labels untouched.
+# P(X) shifts per cohort; P(Y|X) is invariant. The mechanism is exactly
+# CIFAR-10-C in spirit: deterministic, severity-fixed image distortions.
+#
+# Cohort assignments (matching label-drift cohorts):
+#   A -> Gaussian noise (additive, std=0.15 in normalized space)
+#   B -> Gaussian blur  (5x5 depthwise conv, sigma=1.5)
+#   C -> Contrast halving (x_norm * 0.5, then brightness shift +0.3)
+# Each is seeded for reproducibility. Each produces a NEW tensor (callers
+# use `.copy_` to write back).
+# ============================================================
+
+def _corrupt_gauss_noise(x, std=0.15, seed=0):
+    """Additive Gaussian noise on normalized images. Seeded for reproducibility."""
+    g = torch.Generator(device=x.device).manual_seed(seed)
+    noise = torch.randn(x.shape, generator=g, device=x.device) * std
+    return x + noise
+
+
+def _corrupt_gauss_blur(x, kernel_size=5, sigma=1.5):
+    """Gaussian blur via depthwise conv. Shape-preserving (padding=half)."""
+    half = kernel_size // 2
+    coords = torch.arange(kernel_size, dtype=torch.float32, device=x.device) - half
+    g1d = torch.exp(-(coords ** 2) / (2 * sigma * sigma))
+    g2d = (g1d[:, None] * g1d[None, :])
+    g2d = g2d / g2d.sum()
+    C = x.shape[1]
+    kernel = g2d.view(1, 1, kernel_size, kernel_size).expand(C, 1, kernel_size, kernel_size).contiguous()
+    return F.conv2d(x, kernel, padding=half, groups=C)
+
+
+def _corrupt_contrast(x, factor=0.5, shift=0.3):
+    """Contrast scale + brightness shift in normalized space."""
+    return x * factor + shift
+
+
+# Dispatch table for cohort -> corruption function.
+# Each entry returns a NEW tensor (use .copy_ to overwrite).
+COVARIATE_KIND_FN = {
+    'gauss_noise':  lambda x, seed: _corrupt_gauss_noise(x, std=0.15, seed=seed),
+    'gauss_blur':   lambda x, seed: _corrupt_gauss_blur(x, kernel_size=5, sigma=1.5),
+    'contrast':     lambda x, seed: _corrupt_contrast(x, factor=0.5, shift=0.3),
+}
+
+# Set by --covariate-drift in __main__: dict[cohort_label -> kind_str].
+# When None, all covariate-drift code paths are no-ops and the harness
+# uses the existing label-drift (swap or permutation) path.
+COVARIATE_CORRUPTIONS = None
+
+# Per-cohort corrupted TEST_X variants. Allocated in __main__ only when
+# --covariate-drift is set (4 x ~117 MB GPU). Variant 0 stays canonical.
+TEST_X_VARIANTS = None
+
+# Canonical backup of GPU_CLIENT_X (allocated in __main__ only when
+# --covariate-drift is set). Restored at the start of each method run by
+# fresh_client_y(), so cross-method drift doesn't leak into images.
+GPU_CLIENT_X_CANONICAL = None
+
+
 def apply_drift_event(client_y, event_idx):
     """
     Apply the swap mapping of DRIFT_EVENTS[event_idx] in-place on the per-method
@@ -328,9 +421,23 @@ def apply_drift_event(client_y, event_idx):
     metric ARE mutated here via apply_test_drift_event, so the per-cohort test
     swaps stay in lockstep with the per-client training-label swaps.
     """
-    swaps = DRIFT_EVENTS[event_idx]
-    rnd   = DRIFT_SCHEDULE[event_idx]
+    rnd = DRIFT_SCHEDULE[event_idx]
     print(f"\n  *** Drift event {event_idx} at round {rnd} ***")
+    if COVARIATE_CORRUPTIONS is not None:
+        # Per-cohort image corruption mode (--covariate-drift).
+        # Mutates GPU_CLIENT_X[cid] in place per client. The canonical backup
+        # in GPU_CLIENT_X_CANONICAL is restored at the start of each new
+        # method run via fresh_client_y(). Labels (client_y) are NOT touched.
+        for group_label, group_clients in DRIFT_GROUPS.items():
+            kind = COVARIATE_CORRUPTIONS[group_label]
+            fn   = COVARIATE_KIND_FN[kind]
+            print(f"  Group {group_label} {group_clients}: corruption = {kind}")
+            for cid in group_clients:
+                new_x = fn(GPU_CLIENT_X[cid], seed=42 + cid)
+                GPU_CLIENT_X[cid].copy_(new_x)
+        apply_test_drift_event(event_idx)
+        return
+    swaps = DRIFT_EVENTS[event_idx]
     for group_label, group_clients in DRIFT_GROUPS.items():
         a, b = swaps[group_label]
         print(f"  Group {group_label} {group_clients}: swap {a}<->{b}")
@@ -1671,6 +1778,13 @@ def parse_args():
                         f"partition (default {ALPHA_DIR}). Smaller alpha is "
                         f"more non-IID; alpha=0.5 is moderately non-IID. "
                         f"Triggers re-partitioning of the train set.")
+    p.add_argument('--covariate-drift', action='store_true',
+                   help="Single sudden drift at round 100 where each cohort "
+                        "applies a per-cohort IMAGE CORRUPTION (labels untouched): "
+                        "A=Gaussian noise std=0.15, B=Gaussian blur 5x5 sigma=1.5, "
+                        "C=contrast x0.5 + shift 0.3. P(X) shifts per cohort, "
+                        "P(Y|X) is invariant. The per-client metric uses per-cohort "
+                        "corrupted TEST_X variants with canonical TEST_Y.")
     return p.parse_args()
 
 
@@ -1850,6 +1964,39 @@ if __name__ == '__main__':
         sizes = [GPU_CLIENT_X[i].size(0) for i in range(NUM_CLIENTS)]
         print(f"  Re-partitioned: samples/client min={min(sizes)} "
               f"max={max(sizes)} mean={int(np.mean(sizes))}")
+
+    if args.covariate_drift:
+        # Single sudden COVARIATE drift at round 100: each cohort gets a
+        # different image corruption applied to its training X (and the
+        # cohort-specific TEST_X variant), labels untouched.
+        DRIFT_SCHEDULE[:] = [100]
+        COVARIATE_CORRUPTIONS = {
+            'A': 'gauss_noise',
+            'B': 'gauss_blur',
+            'C': 'contrast',
+        }
+        # Allocate per-cohort TEST_X variants (4 x ~117 MB on GPU). Variant 0
+        # stays canonical; [1]/[2]/[3] will be mutated at drift via
+        # apply_test_drift_event.
+        TEST_X_VARIANTS = {
+            0: TEST_X.clone(),
+            1: TEST_X.clone(),
+            2: TEST_X.clone(),
+            3: TEST_X.clone(),
+        }
+        # Canonical backup of GPU_CLIENT_X so fresh_client_y() can restore
+        # between method runs (apply_drift_event mutates GPU_CLIENT_X in place).
+        GPU_CLIENT_X_CANONICAL = {
+            cid: GPU_CLIENT_X[cid].clone() for cid in range(NUM_CLIENTS)
+        }
+        _x_mb  = sum(t.element_size() * t.numel() for t in GPU_CLIENT_X_CANONICAL.values()) / (1024**2)
+        _tx_mb = sum(t.element_size() * t.numel() for t in TEST_X_VARIANTS.values()) / (1024**2)
+        print(f"\n[--covariate-drift] DRIFT_SCHEDULE = {DRIFT_SCHEDULE} "
+              f"(single sudden COVARIATE drift; per-cohort image corruption, labels untouched)")
+        print(f"  cohort A (id%10 < 3): {COVARIATE_CORRUPTIONS['A']}    (Gaussian noise std=0.15)")
+        print(f"  cohort B (3<=id%10<6): {COVARIATE_CORRUPTIONS['B']}   (Gaussian blur 5x5 sigma=1.5)")
+        print(f"  cohort C (id%10 >= 6): {COVARIATE_CORRUPTIONS['C']}   (contrast x0.5 + shift 0.3)")
+        print(f"  GPU memory: canonical X backup = {_x_mb:.1f} MiB; TEST_X variants = {_tx_mb:.1f} MiB")
 
     print("\n" + "="*60)
     print(f"RUNNING METHODS: {' -> '.join(method_names)}")
