@@ -692,8 +692,20 @@ def run_flash():
     gm       = get_model()
     reset_per_client_metric_state()
     log      = []
+    # Instrumentation columns (Flash confounding gate, 2026-06-24):
+    #   agg_norm       = ||agg||_2                  (raw mean-update magnitude)
+    #   first_mom_norm = ||first_mom||_2            (EMA mean update)
+    #   second_mom_norm= ||sqrt(second_mom)||_2     (EMA RMS update)
+    #   delta_mom_norm = ||delta_mom||_2            (drift-correction signal)
+    #   flash_amp      = ||delta_mom|| / (||sqrt(second_mom)|| + TAU)
+    #                       fraction of the agg_update divisor captured by the
+    #                       drift correction. ~0 = behaves like vanilla Adam;
+    #                       approaching 1 = Flash's "drift correction" dominates.
+    # Logging the per-round magnitude lets the gate diagnose spurious firing.
     csv_out  = LiveCSV(seeded_path('results_Flash.csv'),
-                       ['round', 'global_acc', 'per_client_gen_acc'] + CLIENT_FIELDS)
+                       ['round', 'global_acc', 'per_client_gen_acc',
+                        'agg_norm', 'first_mom_norm', 'second_mom_norm',
+                        'delta_mom_norm', 'flash_amp'] + CLIENT_FIELDS)
     crit     = nn.CrossEntropyLoss()
 
     first_mom  = 0
@@ -768,6 +780,13 @@ def run_flash():
             agg_update = (SERVER_LR * first_mom /
                           (np.sqrt(second_mom) - delta_mom + TAU_FLASH))
 
+            # Flash trigger diagnostics
+            agg_norm        = float(np.linalg.norm(agg))
+            first_mom_norm  = float(np.linalg.norm(first_mom))
+            second_mom_rms  = float(np.linalg.norm(np.sqrt(np.abs(second_mom))))
+            delta_mom_norm  = float(np.linalg.norm(delta_mom))
+            flash_amp       = delta_mom_norm / (second_mom_rms + TAU_FLASH)
+
             cur_global = parameters_to_vector(gm.parameters()).detach()
             new_global = cur_global + torch.tensor(
                 agg_update, dtype=torch.float32).to(DEVICE)
@@ -777,7 +796,12 @@ def run_flash():
             pc_acc     = evaluate_per_client_gen_acc(gm)
             local_accs = evaluate_all_clients(gm, client_y)
             row        = build_local_row(rnd, acc, local_accs,
-                                         extra={'per_client_gen_acc': pc_acc})
+                                         extra={'per_client_gen_acc': pc_acc,
+                                                'agg_norm':       agg_norm,
+                                                'first_mom_norm': first_mom_norm,
+                                                'second_mom_norm': second_mom_rms,
+                                                'delta_mom_norm': delta_mom_norm,
+                                                'flash_amp':      flash_amp})
             log.append(row)
             csv_out.write(row)
 
@@ -786,7 +810,9 @@ def run_flash():
                 mean_local = sum(local_accs) / len(local_accs)
                 print(f"  Round {rnd:03d} | Global: {acc:.4f} | "
                       f"per-client: {pc_acc:.4f} | "
-                      f"mean local: {mean_local:.4f}{tag}")
+                      f"mean local: {mean_local:.4f} | "
+                      f"flash_amp={flash_amp:.4f} delta_mom_norm={delta_mom_norm:.5f}"
+                      f"{tag}")
     finally:
         csv_out.close()
     print(f"  Results: {csv_out.path}")
@@ -1671,6 +1697,16 @@ def parse_args():
                         f"partition (default {ALPHA_DIR}). Smaller alpha is "
                         f"more non-IID; alpha=0.5 is moderately non-IID. "
                         f"Triggers re-partitioning of the train set.")
+    p.add_argument('--no-drift', action='store_true',
+                   help="No drift events fire at all. DRIFT_SCHEDULE is cleared. "
+                        "Use to test methods under STATIC heterogeneity only "
+                        "(diagnostic for spurious drift-detection firing).")
+    p.add_argument('--partial-cohorts', type=str, default=None,
+                   help="Comma-separated cohort labels that DRIFT. Cohorts not "
+                        "listed stay at the canonical labeling for the whole run. "
+                        "E.g. --partial-cohorts A means only cohort A (6 of 20 "
+                        "clients) drifts at scheduled rounds; B and C stay clean. "
+                        "Valid cohorts: A, B, C.")
     return p.parse_args()
 
 
@@ -1781,6 +1817,24 @@ if __name__ == '__main__':
     if args.recurrent:
         DRIFT_SCHEDULE[:] = DRIFT_SCHEDULE_RECURRENT
         print(f"[--recurrent] DRIFT_SCHEDULE = {DRIFT_SCHEDULE} (multi-event drift)")
+
+    if args.no_drift:
+        DRIFT_SCHEDULE.clear()
+        print(f"[--no-drift] DRIFT_SCHEDULE = [] (no drift events fire; static heterogeneity only)")
+
+    if args.partial_cohorts is not None:
+        keep = {c.strip() for c in args.partial_cohorts.split(',') if c.strip()}
+        unknown = keep - set(DRIFT_GROUPS.keys())
+        if unknown:
+            raise SystemExit(f"--partial-cohorts: unknown cohort(s) {unknown}; "
+                             f"valid: {list(DRIFT_GROUPS.keys())}")
+        dropped = [g for g in list(DRIFT_GROUPS.keys()) if g not in keep]
+        for g in dropped:
+            DRIFT_GROUPS.pop(g)
+        drifting = sum(len(v) for v in DRIFT_GROUPS.values())
+        print(f"[--partial-cohorts] keep={sorted(keep)} drop={dropped} "
+              f"({drifting}/{NUM_CLIENTS} clients drift; "
+              f"{NUM_CLIENTS - drifting} stay clean)")
 
     if args.alternating_drift:
         # Frequent alternating drift: same cohort swap applied at every event.
