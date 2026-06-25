@@ -97,6 +97,12 @@ MOMENTUM       = 0.9
 WEIGHT_DECAY   = 1e-5
 ALPHA_DIR      = 0.1
 SEED           = 0
+
+# Per-round LR boost (only consumed by run_fedavg). Defaults are no-op.
+# --lr-boost-factor (multiplier on LR) only applies inside [start, end).
+LR_BOOST_FACTOR = 1.0
+LR_BOOST_START  = 100   # default boost window aligns with canonical drift
+LR_BOOST_END    = 110
 DEVICE         = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Drift schedule.
@@ -539,6 +545,10 @@ class LiveCSV:
 def run_fedavg():
     print("\n" + "="*60)
     print("METHOD 1: FedAvg")
+    print(f"  base lr = {LR}")
+    if LR_BOOST_FACTOR != 1.0:
+        print(f"  ORACLE BOOST active: lr * {LR_BOOST_FACTOR} during rounds "
+              f"[{LR_BOOST_START}, {LR_BOOST_END})")
     print("="*60)
 
     client_y = fresh_client_y()
@@ -546,18 +556,23 @@ def run_fedavg():
     reset_per_client_metric_state()
     log      = []
     csv_out  = LiveCSV(seeded_path('results_FedAvg.csv'),
-                       ['round', 'global_acc', 'per_client_gen_acc'] + CLIENT_FIELDS)
+                       ['round', 'global_acc', 'per_client_gen_acc', 'lr'] + CLIENT_FIELDS)
 
     try:
         for rnd in range(NUM_ROUNDS):
             if rnd in DRIFT_SCHEDULE:
                 apply_drift_event(client_y, DRIFT_SCHEDULE.index(rnd))
 
+            # Per-round LR; boost only applies if --lr-boost-factor != 1
+            in_boost = (LR_BOOST_FACTOR != 1.0
+                        and LR_BOOST_START <= rnd < LR_BOOST_END)
+            lr_this_round = LR * LR_BOOST_FACTOR if in_boost else LR
+
             states, weights = [], []
             for cid in range(NUM_CLIENTS):
                 lm = get_model()
                 lm.load_state_dict({k: v.clone() for k, v in gm.state_dict().items()})
-                local_train_gpu(lm, GPU_CLIENT_X[cid], client_y[cid])
+                local_train_gpu(lm, GPU_CLIENT_X[cid], client_y[cid], lr=lr_this_round)
                 states.append(lm.state_dict())
                 weights.append(CLIENT_WEIGHTS[cid])
 
@@ -566,16 +581,21 @@ def run_fedavg():
             pc_acc     = evaluate_per_client_gen_acc(gm)
             local_accs = evaluate_all_clients(gm, client_y)
             row        = build_local_row(rnd, acc, local_accs,
-                                         extra={'per_client_gen_acc': pc_acc})
+                                         extra={'per_client_gen_acc': pc_acc,
+                                                'lr': lr_this_round})
             log.append(row)
             csv_out.write(row)
 
-            if rnd % 10 == 0 or rnd in DRIFT_SCHEDULE:
-                tag = "  <-- DRIFT" if rnd in DRIFT_SCHEDULE else ""
+            if rnd % 10 == 0 or rnd in DRIFT_SCHEDULE or rnd == LR_BOOST_START or rnd == LR_BOOST_END:
+                tags = []
+                if rnd in DRIFT_SCHEDULE: tags.append("DRIFT")
+                if rnd == LR_BOOST_START and LR_BOOST_FACTOR != 1.0: tags.append("BOOST-ON")
+                if rnd == LR_BOOST_END   and LR_BOOST_FACTOR != 1.0: tags.append("BOOST-OFF")
+                tag = "  <-- " + ", ".join(tags) if tags else ""
                 mean_local = sum(local_accs) / len(local_accs)
                 print(f"  Round {rnd:03d} | Global: {acc:.4f} | "
                       f"per-client: {pc_acc:.4f} | "
-                      f"mean local: {mean_local:.4f}{tag}")
+                      f"mean local: {mean_local:.4f} | lr={lr_this_round}{tag}")
     finally:
         csv_out.close()
     print(f"  Results: {csv_out.path}")
@@ -1376,6 +1396,107 @@ def run_flashnorm_v2():
                       f"mean local: {mean_local:.4f} | "
                       f"amp_new={flash_amp_new:.4f} ratio={ratio_norm_val:.4f}"
                       f"{tag}")
+    finally:
+        csv_out.close()
+    print(f"  Results: {csv_out.path}")
+    return log
+
+
+# ============================================================
+# METHOD 11 — FedAvgAdam (action-ceiling control, NO drift trigger)
+# Same client local training as FedAvg, but the SERVER aggregation uses
+# Flash's Adam-style step with delta_mom = 0 always. Isolates the action's
+# stable-accuracy ceiling vs plain FedAvg's simple averaging, independent of
+# any trigger.
+# ============================================================
+
+def run_fedavg_adam():
+    print("\n" + "="*60)
+    print("METHOD 11: FedAvgAdam (no trigger; Flash's action with delta_mom=0)")
+    print("="*60)
+
+    SERVER_LR = 0.01    # Flash defaults — keep action identical to Flash
+    BETA1     = 0.9
+    BETA2     = 0.99
+    TAU_FLASH = 0.001
+
+    client_y = fresh_client_y()
+    gm       = get_model()
+    reset_per_client_metric_state()
+    log      = []
+    csv_out  = LiveCSV(seeded_path('results_FedAvgAdam.csv'),
+                       ['round', 'global_acc', 'per_client_gen_acc',
+                        'agg_norm', 'first_mom_norm', 'second_mom_norm'] + CLIENT_FIELDS)
+    crit     = nn.CrossEntropyLoss()
+
+    first_mom  = 0
+    second_mom = TAU_FLASH ** 2
+
+    try:
+        for rnd in range(NUM_ROUNDS):
+            if rnd in DRIFT_SCHEDULE:
+                apply_drift_event(client_y, DRIFT_SCHEDULE.index(rnd))
+
+            updates, weights = [], []
+            for cid in range(NUM_CLIENTS):
+                lm = get_model()
+                lm.load_state_dict({k: v.clone() for k, v in gm.state_dict().items()})
+                lm.train()
+                init_params = parameters_to_vector(lm.parameters()).detach()
+                opt = optim.SGD(lm.parameters(), lr=LR,
+                                momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
+                x_cid = GPU_CLIENT_X[cid]
+                y_cid = client_y[cid]
+                n     = x_cid.size(0)
+                end   = (n // BATCH_SIZE) * BATCH_SIZE
+
+                for epoch in range(LOCAL_EPOCHS):
+                    perm = torch.randperm(n, device=DEVICE)
+                    for s in range(0, end, BATCH_SIZE):
+                        idx = perm[s:s+BATCH_SIZE]
+                        xb  = gpu_augment(x_cid[idx])
+                        opt.zero_grad()
+                        crit(lm(xb), y_cid[idx]).backward()
+                        opt.step()
+
+                cur_params = parameters_to_vector(lm.parameters()).detach()
+                updates.append((cur_params - init_params).cpu().numpy())
+                weights.append(CLIENT_WEIGHTS[cid])
+
+            total = sum(weights)
+            agg   = sum(u * (w/total) for u, w in zip(updates, weights))
+
+            first_mom  = BETA1 * first_mom + (1 - BETA1) * agg
+            second_mom = BETA2 * second_mom + (1 - BETA2) * np.square(agg)
+
+            # Adam step with no drift correction (delta_mom = 0)
+            agg_update = SERVER_LR * first_mom / (np.sqrt(second_mom) + TAU_FLASH)
+
+            cur_global = parameters_to_vector(gm.parameters()).detach()
+            new_global = cur_global + torch.tensor(
+                agg_update, dtype=torch.float32).to(DEVICE)
+            vector_to_parameters(new_global, gm.parameters())
+
+            acc        = evaluate_gpu(gm)
+            pc_acc     = evaluate_per_client_gen_acc(gm)
+            local_accs = evaluate_all_clients(gm, client_y)
+            agg_norm        = float(np.linalg.norm(agg))
+            first_mom_norm  = float(np.linalg.norm(first_mom))
+            second_mom_rms  = float(np.linalg.norm(np.sqrt(np.abs(second_mom))))
+            row = build_local_row(rnd, acc, local_accs,
+                                  extra={'per_client_gen_acc': pc_acc,
+                                         'agg_norm': agg_norm,
+                                         'first_mom_norm': first_mom_norm,
+                                         'second_mom_norm': second_mom_rms})
+            log.append(row)
+            csv_out.write(row)
+
+            if rnd % 10 == 0 or rnd in DRIFT_SCHEDULE:
+                tag = "  <-- DRIFT" if rnd in DRIFT_SCHEDULE else ""
+                mean_local = sum(local_accs) / len(local_accs)
+                print(f"  Round {rnd:03d} | Global: {acc:.4f} | "
+                      f"per-client: {pc_acc:.4f} | "
+                      f"mean local: {mean_local:.4f}{tag}")
     finally:
         csv_out.close()
     print(f"  Results: {csv_out.path}")
@@ -2186,6 +2307,7 @@ METHOD_REGISTRY = {
     7: ('FlashNormTrigger',  run_flashnorm),      # V1: heterogeneity-normalized Flash trigger (server-side)
     8: ('FlashColdInit',     run_flashcoldinit),  # attribution control: Flash + cold-start init only
     9: ('FlashNormV2',       run_flashnorm_v2),   # V2: per-tensor B, fixed warmup window, normalized trigger from round 25
+    11: ('FedAvgAdam',       run_fedavg_adam),    # action-ceiling control: Flash's Adam step with delta_mom=0
 }
 
 
@@ -2203,6 +2325,7 @@ def parse_args():
                 "  7  FlashNormTrigger (V1: heterogeneity-normalized Flash trigger; server-side)\n"
                 "  8  FlashColdInit (attribution control: Flash + cold-start init only)\n"
                 "  9  FlashNormV2 (per-tensor B, fixed warmup window, normalized trigger)\n"
+                " 11  FedAvgAdam (action-ceiling control: Flash's Adam step, no drift trigger)\n"
                 "\nExamples:\n"
                 "  python3 all_experiments_optimized.py\n"
                 "  python3 all_experiments_optimized.py --methods 1\n"
@@ -2282,6 +2405,19 @@ def parse_args():
                         f"Smaller => faster baseline (risks absorbing real drift). "
                         f"Larger => slower baseline (risks staleness). Use for the "
                         f"beta_b sensitivity ablation.")
+    p.add_argument('--lr', type=float, default=None,
+                   help=f"Override base LR for the run (default {LR}). Affects ALL "
+                        f"methods that consume LR via local_train_gpu. Used by the "
+                        f"headroom gate's always-higher-LR control (e.g. --lr 0.03).")
+    p.add_argument('--lr-boost-factor', type=float, default=None,
+                   help=f"Multiplier on base LR during the boost window (default 1.0 = no boost). "
+                        f"Used by the headroom gate's oracle-boost config: at a known drift "
+                        f"round, apply a temporary LR boost. Only consumed by run_fedavg.")
+    p.add_argument('--lr-boost-start', type=int, default=None,
+                   help=f"First round of the LR boost window (default {LR_BOOST_START}, "
+                        f"the canonical drift round).")
+    p.add_argument('--lr-boost-end', type=int, default=None,
+                   help=f"End round (exclusive) of the LR boost window (default {LR_BOOST_END}).")
     return p.parse_args()
 
 
@@ -2445,6 +2581,19 @@ if __name__ == '__main__':
     if args.flashnorm_beta_b is not None:
         FLASHNORM_BETA_B = args.flashnorm_beta_b
         print(f"[--flashnorm-beta-b] FLASHNORM_BETA_B = {FLASHNORM_BETA_B}")
+
+    if args.lr is not None:
+        LR = args.lr
+        print(f"[--lr override] LR = {LR}")
+    if args.lr_boost_factor is not None:
+        LR_BOOST_FACTOR = args.lr_boost_factor
+        print(f"[--lr-boost-factor] LR_BOOST_FACTOR = {LR_BOOST_FACTOR}")
+    if args.lr_boost_start is not None:
+        LR_BOOST_START = args.lr_boost_start
+        print(f"[--lr-boost-start] LR_BOOST_START = {LR_BOOST_START}")
+    if args.lr_boost_end is not None:
+        LR_BOOST_END = args.lr_boost_end
+        print(f"[--lr-boost-end] LR_BOOST_END = {LR_BOOST_END}")
 
     if args.out_dir is not None:
         OUT_DIR = args.out_dir
