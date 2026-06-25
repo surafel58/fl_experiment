@@ -110,7 +110,45 @@ Working title candidate: **"The Flash limitation is in the action, not the trigg
 **Evidence to include:**
 - ☐ The progression table above
 - ☐ Algebraic decomposition: when `delta_mom = 0`, Flash's action = vanilla server-side Adam. V2 during the WARMUP phase IS vanilla server-side Adam (delta_mom = 0 by construction for rounds 0–24). V2's overall stable accuracy is bounded above by what vanilla server-side Adam would achieve. If we ran "pure FedAvg-Adam" (no trigger at all, vanilla Adam aggregation), we'd expect ~the V2 stable level.
-- ☐ Optional confirmatory experiment we could add to make this airtight: run pure FedAvg-Adam (vanilla server-side Adam, no Flash trigger machinery at all, delta_mom = 0 throughout). Predicted: stable ~0.69–0.70 in no-drift. This would isolate "the action ceiling" as an independent finding. **OPEN QUESTION: include this run or argue from V2's warmup phase as the proxy?**
+- ☐ **CONFIRMED EXPERIMENTALLY (2026-06-25 headroom gate):** FedAvgAdam (method 11 — Flash's Adam action with delta_mom=0 throughout, no trigger at all):
+  - No-drift: V2 stable 0.6960 (which IS vanilla Adam during warmup + silent trigger after) → action ceiling lives there.
+  - **Canonical drift: FedAvgAdam stable 0.5773, plain FedAvg stable 0.5887 → −1.14pp action gap, matching the −1.32pp no-drift gap.**
+  - **The action ceiling is bilateral and consistent across regimes — not a no-drift artifact.**
+
+---
+
+## Section 4b — The headroom gate (action confirmed via a different angle)
+
+**Subhead:** "Even with oracle drift timing, a brief LR boost on plain FedAvg leaves no headroom."
+
+**Motivating question (after Sections 3+4 closed the trigger-fix direction):** *Could a drift-triggered boost on top of FedAvg's STABLE simple-averaging action open the gap that Flash's Adam action couldn't?* This gate tests whether plain FedAvg leaves any headroom AT the drift event itself — bypassing the Adam action entirely.
+
+**Configs tested, single seed, canonical Dir(0.1) drift @ rd 100:**
+- Plain FedAvg (baseline)
+- Oracle-boosted FedAvg: 2x/3x/5x LR boost during rounds [100, 110) (the oracle knows the drift round)
+- Always-higher LR: 2x/3x/5x LR applied throughout (critical control — separates "boost AT drift specifically" from "higher LR generally helps")
+- FedAvgAdam (no trigger) — also runs here as the action-ceiling check
+
+**Result table:**
+
+| Config | Dip | Stable | Δ stable vs Plain | Δ stable vs same-factor Always |
+|---|---:|---:|---:|---:|
+| Plain FedAvg | 0.1219 | **0.5887** | — | — |
+| Oracle 2x | 0.1384 | 0.5849 | −0.38pp | −0.09pp |
+| Oracle 3x | 0.2102 | 0.5918 | +0.31pp | **+1.81pp** |
+| Oracle 5x | 0.6102 | CRASHED | — | — |
+| Always 2x (lr=0.02) | 0.1215 | 0.5858 | −0.29pp | — |
+| Always 3x (lr=0.03) | 0.1390 | 0.5737 | −1.50pp | — |
+| Always 5x (lr=0.05) | — | CRASHED | — | — |
+
+**Verdict: FAIL (no exploitable headroom).**
+- ☐ 2x: oracle WORSE than plain stable (−0.38pp), oracle ≈ always (Δ −0.09pp). Trigger adds nothing.
+- ☐ 3x: oracle marginally beats plain (+0.31pp, single-seed, within ±1pp noise) AND beats always_3x (+1.81pp) — but always_3x is degraded (lr=0.03 generally too high → −1.50pp below plain), so "oracle beats always_3x" reflects always_3x's degradation more than oracle's gain. The +0.31pp over plain is single-seed noise level.
+- ☐ 5x: both configs crash. The boost factor magnitude that might overcome plain FedAvg's self-recovery rate is too aggressive to be stable on this benchmark.
+
+**Mechanism (the deeper finding):** at label-swap drift, clients train for ~10-30 rounds on wrong-direction gradients while figuring out the new label mapping. Boosting their LR during this window amplifies the wrong updates → deeper dip (oracle 3x dipped +8.83pp deeper than plain). The boost ends, model has more damage to recover from. Final stable asymptotes to ~plain FedAvg's stable. **There is no "knob to turn up" at drift because FedAvg's drift-recovery bottleneck is client-side label-relearning, not aggregator convergence speed.**
+
+**Files:** `runs/2026-06-25-headroom-gate/`, `headroom_gate_analysis.py`, branch `headroom-gate-fail` (commit b0a6795).
 
 ---
 
@@ -159,6 +197,11 @@ rd 110   global=0.100   amp_new=NaN
 - ☐ A heterogeneity-aware trigger CAN silence spurious firing (V2 demonstrated this), but the residual gap is in the action.
 - ☐ This suggests the FedDrift/Flash/Saile family — which all preserve some form of adaptive-LR action — share a similar ceiling.
 
+**The drift-triggered FedAvg-modulation direction:**
+- ☐ Putting a drift trigger on TOP of FedAvg's simple-averaging action (instead of Flash's Adam action) was the next natural pivot. Section 4b (headroom gate) tests this.
+- ☐ Result: oracle drift-timed LR boost on plain FedAvg leaves no exploitable headroom. FedAvg self-recovers as fast as a brief LR boost can, because the drift bottleneck is client-side label-relearning, not server-side convergence speed.
+- ☐ This closes the "trigger + FedAvg action" direction in addition to "trigger + Flash action".
+
 **What would beat FedAvg on this benchmark:**
 - ☐ Replace the action class entirely: e.g., trigger drives a learning-rate schedule rather than a per-parameter divisor (action stays close to FedAvg's simple averaging).
 - ☐ Or: stay with FedAvg as the base action and add drift detection only as a re-clustering / re-initialization trigger (the FedDrift family direction).
@@ -177,11 +220,12 @@ rd 110   global=0.100   amp_new=NaN
 
 **What we proved:**
 1. ☐ Flash's spurious firing on heterogeneity is real (gate PASS, 3 seeds).
-2. ☐ The trigger IS fixable (V2 achieves silence).
-3. ☐ But fixing the trigger cannot beat FedAvg — Flash's action has a 1pp ceiling below simple averaging AND a stability margin that caps trigger response strength.
-4. ☐ Therefore: the trigger-improvement research direction is closed for this benchmark; the limitation lives in the action.
+2. ☐ The trigger IS fixable (V2 achieves silence, beats Flash by +2.18pp in no-drift).
+3. ☐ But fixing the trigger cannot beat FedAvg — Flash's action has a bilateral ceiling below simple averaging (−1.32pp no-drift, −1.14pp canonical drift) AND a stability margin that caps trigger response strength (V2 NaN'd on drift response).
+4. ☐ **A drift-triggered LR boost on plain FedAvg ALSO fails:** oracle-timed boost leaves no exploitable headroom over plain FedAvg at the drift event (headroom gate, single seed; +0.31pp single-seed-noise gain at 3x at the cost of +8.83pp deeper dip; 5x crashes).
+5. ☐ Therefore: BOTH the trigger-improvement direction (with Flash's action) AND the drift-modulation direction (with FedAvg's action) are closed for this benchmark. The drift-recovery bottleneck is client-side label-relearning, which neither aggregator-level adjustments nor LR boosts can shortcut.
 
-**Why this is worth writing up:** The first three findings are real. The fourth is a calibration of expectations for an entire research direction. Negative results that map a failure surface ARE contributions if the map is precise.
+**Why this is worth writing up:** Five findings are real. They jointly map a four-corner failure surface (trigger×action ∈ {Flash, FedAvg}²) around the "improve Flash" research direction. Negative results that map a failure surface this precisely ARE contributions.
 
 ---
 
