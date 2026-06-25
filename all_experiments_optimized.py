@@ -820,6 +820,569 @@ def run_flash():
 
 
 # ============================================================
+# METHOD 7 — FlashNormTrigger (V1)
+# Heterogeneity-normalized Flash trigger. Same action as Flash; only the
+# delta_mom signal is normalized by a slow per-parameter EMA of agg^2 (the
+# heterogeneity baseline B). Server-side only (V1). Cold-start B_0 =
+# first-round agg^2, so norm_delta is ~0 at round 1 and the trigger is
+# silent initially.
+#
+# Math (compare to Flash):
+#   agg_t         = sum_i w_i * (theta_i_t - theta_global_t)        # unchanged
+#   second_mom_t  = beta2 * second_mom_{t-1} + (1-beta2) * agg_t^2  # unchanged
+#   B_t           = beta_b * B_{t-1} + (1-beta_b) * agg_t^2         # NEW (slow EMA)
+#   norm_delta_t  = (agg_t^2 - second_mom_t) / (B_t + eps_norm)     # NEW elementwise
+#   delta_mom_t   = beta3 * delta_mom_{t-1} + (1-beta3)*norm_delta_t
+#   agg_update_t  = server_lr * first_mom_t /
+#                   (sqrt(second_mom_t) - delta_mom_t + tau)        # SAME action
+#
+# Sign of norm_delta_t is preserved (not absolute-valued): negative values
+# correctly enlarge the denominator and attenuate the step, matching Flash's
+# original sign convention.
+# ============================================================
+FLASHNORM_BETA_B = 0.999    # slow heterogeneity-baseline EMA; overridable via --flashnorm-beta-b
+FLASHNORM_EPS    = 1e-8     # divisor stabilizer for norm_delta (separate from Flash's tau)
+
+
+def run_flashnorm():
+    print("\n" + "="*60)
+    print("METHOD 7: FlashNormTrigger")
+    print(f"  beta_b={FLASHNORM_BETA_B}  eps_norm={FLASHNORM_EPS}")
+    print("="*60)
+
+    SERVER_LR      = 0.01    # Flash defaults — only the trigger changes
+    LOSS_DECREMENT = 0.004
+    BETA1          = 0.9
+    BETA2          = 0.99
+    TAU_FLASH      = 0.001
+    BETA_B         = FLASHNORM_BETA_B
+    EPS_NORM       = FLASHNORM_EPS
+
+    client_y = fresh_client_y()
+    gm       = get_model()
+    reset_per_client_metric_state()
+    log      = []
+    # Columns mirror Flash, plus B_norm (sqrt-EMA of heterogeneity baseline)
+    # and amp_new = ||delta_mom|| / (||sqrt(second_mom)|| + tau).
+    csv_out  = LiveCSV(seeded_path('results_FlashNormTrigger.csv'),
+                       ['round', 'global_acc', 'per_client_gen_acc',
+                        'agg_norm', 'first_mom_norm', 'second_mom_norm',
+                        'delta_mom_norm', 'flash_amp_new', 'B_norm',
+                        'ratio_norm', 'scaled_delta_norm'] + CLIENT_FIELDS)
+    crit     = nn.CrossEntropyLoss()
+
+    first_mom    = 0
+    # second_mom and B are BOTH cold-started from the first round's agg^2
+    # (see ratio formula below). The aligned cold-start is required: the
+    # normalization (agg^2 - second_mom)/(B + eps) only produces ~0 under
+    # static heterogeneity if the two EMAs share an initial baseline. Flash's
+    # scalar tau^2 init contaminates the ratio for low-gradient parameters in
+    # round 0; aligning the cold-start removes that artifact. After round 0
+    # the EMAs evolve at their own beta rates (Flash's beta2=0.99, our
+    # beta_b=0.999) and the action dynamics are identical to Flash's.
+    second_mom   = None                     # cold-start from first agg^2
+    prev_2mom    = None                     # tracks previous second_mom for Flash's adaptive beta3
+    delta_mom    = 0
+    B            = None                     # cold-start from first agg^2
+    prev_val_loss = {cid: -1 for cid in range(NUM_CLIENTS)}
+
+    try:
+        for rnd in range(NUM_ROUNDS):
+            if rnd in DRIFT_SCHEDULE:
+                apply_drift_event(client_y, DRIFT_SCHEDULE.index(rnd))
+
+            updates, weights = [], []
+            for cid in range(NUM_CLIENTS):
+                lm = get_model()
+                lm.load_state_dict({k: v.clone() for k, v in gm.state_dict().items()})
+                lm.train()
+                init_params = parameters_to_vector(lm.parameters()).detach()
+                opt = optim.SGD(lm.parameters(), lr=LR,
+                                momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
+                x_cid = GPU_CLIENT_X[cid]
+                y_cid = client_y[cid]
+                n     = x_cid.size(0)
+                end   = (n // BATCH_SIZE) * BATCH_SIZE
+
+                for epoch in range(LOCAL_EPOCHS):
+                    perm = torch.randperm(n, device=DEVICE)
+                    for s in range(0, end, BATCH_SIZE):
+                        idx = perm[s:s+BATCH_SIZE]
+                        xb  = gpu_augment(x_cid[idx])
+                        opt.zero_grad()
+                        crit(lm(xb), y_cid[idx]).backward()
+                        opt.step()
+
+                    lm.eval()
+                    val_loss = 0.0
+                    vb       = 0
+                    with torch.no_grad():
+                        for s in range(0, n, 256):
+                            xb_v = gpu_augment(x_cid[s:s+256])
+                            val_loss += crit(lm(xb_v), y_cid[s:s+256]).item()
+                            vb       += 1
+                    val_loss /= max(vb, 1)
+
+                    if prev_val_loss[cid] != -1:
+                        delta = prev_val_loss[cid] - val_loss
+                        if 0 < delta < LOSS_DECREMENT / (epoch + 1):
+                            break
+                    prev_val_loss[cid] = val_loss
+                    lm.train()
+
+                cur_params = parameters_to_vector(lm.parameters()).detach()
+                updates.append((cur_params - init_params).cpu().numpy())
+                weights.append(CLIENT_WEIGHTS[cid])
+
+            # Server aggregation
+            total = sum(weights)
+            agg   = sum(u * (w/total) for u, w in zip(updates, weights))
+            agg2  = np.square(agg)
+
+            # Flash's first EMA unchanged.
+            first_mom  = BETA1 * first_mom + (1 - BETA1) * agg
+
+            # Cold-start aligned: on the FIRST round, initialize both EMAs
+            # from agg^2 directly (skipping the usual EMA update). This makes
+            # ratio = (agg^2 - second_mom)/(B + eps) = 0 elementwise at round
+            # 0, so the trigger is silent in the cold-start round as intended.
+            # From round 1 onward the EMAs evolve normally (beta2, beta_b).
+            if second_mom is None:
+                second_mom = agg2.copy()
+                prev_2mom  = agg2.copy()
+                B          = agg2.copy()
+            else:
+                prev_2mom  = second_mom
+                second_mom = BETA2 * second_mom + (1 - BETA2) * agg2
+                B          = BETA_B * B          + (1 - BETA_B) * agg2
+
+            # Normalized, dimension-restored signed signal.
+            # Pure ratio (agg^2 - second_mom)/(B+eps) is UNITLESS; Flash's
+            # action expects delta_mom in agg^2 units. Multiplying by
+            # second_mom restores agg^2 units AND keeps the magnitude at
+            # Flash's typical scale.
+            #
+            # Option II: B_effective = max(B_slow, second_mom) elementwise.
+            # The slow EMA B_slow alone is too cold for params whose agg^2
+            # is rising in early training (B_slow lags below second_mom,
+            # making ratio explode). Flooring B at second_mom bounds the
+            # per-element ratio to |agg^2/second_mom - 1| ~ O(1). Within
+            # our 200-round budget, second_mom (beta2=0.99 -> effective
+            # window ~100 rounds) is typically the floor; B_slow would only
+            # exceed it after ~1000 rounds. So during our runs, B_effective
+            # is effectively second_mom -- the trigger reduces to
+            # "(agg^2 - second_mom) / second_mom * second_mom = agg^2 -
+            # second_mom" times a saturation modulation. Honest framing:
+            # this is closer to "Flash with a scale-stabilized signal"
+            # than to "slow-baseline heterogeneity normalization". The
+            # distinctive long-term-baseline idea only activates beyond
+            # the round budget.
+            B_eff        = np.maximum(B, second_mom)
+            ratio        = (agg2 - second_mom) / (B_eff + EPS_NORM)
+            scaled_delta = ratio * second_mom
+
+            # Flash's ADAPTIVE per-parameter beta3 (unchanged from Flash).
+            beta3 = (np.abs(prev_2mom) /
+                     (np.abs(agg2 - second_mom) +
+                      np.abs(prev_2mom) + 1e-10))
+            delta_mom  = beta3 * delta_mom + (1 - beta3) * scaled_delta
+
+            # IDENTICAL Flash action expression.
+            agg_update = (SERVER_LR * first_mom /
+                          (np.sqrt(second_mom) - delta_mom + TAU_FLASH))
+
+            # Instrumentation
+            agg_norm        = float(np.linalg.norm(agg))
+            first_mom_norm  = float(np.linalg.norm(first_mom))
+            second_mom_rms  = float(np.linalg.norm(np.sqrt(np.abs(second_mom))))
+            delta_mom_norm  = float(np.linalg.norm(delta_mom))
+            flash_amp_new   = delta_mom_norm / (second_mom_rms + TAU_FLASH)
+            B_norm          = float(np.linalg.norm(np.sqrt(np.abs(B))))
+            ratio_norm      = float(np.linalg.norm(ratio))           # unitless ratio magnitude
+            scaled_delta_norm = float(np.linalg.norm(scaled_delta))  # post-scale magnitude
+
+            cur_global = parameters_to_vector(gm.parameters()).detach()
+            new_global = cur_global + torch.tensor(
+                agg_update, dtype=torch.float32).to(DEVICE)
+            vector_to_parameters(new_global, gm.parameters())
+
+            acc        = evaluate_gpu(gm)
+            pc_acc     = evaluate_per_client_gen_acc(gm)
+            local_accs = evaluate_all_clients(gm, client_y)
+            row        = build_local_row(rnd, acc, local_accs,
+                                         extra={'per_client_gen_acc': pc_acc,
+                                                'agg_norm':       agg_norm,
+                                                'first_mom_norm': first_mom_norm,
+                                                'second_mom_norm': second_mom_rms,
+                                                'delta_mom_norm': delta_mom_norm,
+                                                'flash_amp_new':  flash_amp_new,
+                                                'B_norm':         B_norm,
+                                                'ratio_norm':     ratio_norm,
+                                                'scaled_delta_norm': scaled_delta_norm})
+            log.append(row)
+            csv_out.write(row)
+
+            if rnd % 10 == 0 or rnd in DRIFT_SCHEDULE:
+                tag = "  <-- DRIFT" if rnd in DRIFT_SCHEDULE else ""
+                mean_local = sum(local_accs) / len(local_accs)
+                print(f"  Round {rnd:03d} | Global: {acc:.4f} | "
+                      f"per-client: {pc_acc:.4f} | "
+                      f"mean local: {mean_local:.4f} | "
+                      f"amp_new={flash_amp_new:.4f} ratio={ratio_norm:.4f} "
+                      f"B_norm={B_norm:.4f} delta_mom_norm={delta_mom_norm:.5f}"
+                      f"{tag}")
+    finally:
+        csv_out.close()
+    print(f"  Results: {csv_out.path}")
+    return log
+
+
+# ============================================================
+# METHOD 8 — FlashColdInit (attribution control for V1)
+# Stock Flash trigger + action, with ONE change: cold-start init of
+# second_mom (and prev_2mom) from the first round's agg^2 instead of the
+# scalar tau^2. Purpose: confirm the cold-start init change ALONE does NOT
+# fix Flash's spurious firing / no-drift underperformance. If FlashColdInit
+# still trails FedAvg in no-drift like stock Flash, the V1 gain is cleanly
+# attributable to the normalized trigger.
+# ============================================================
+
+def run_flashcoldinit():
+    print("\n" + "="*60)
+    print("METHOD 8: FlashColdInit (attribution control: Flash + cold-start init)")
+    print("="*60)
+
+    SERVER_LR      = 0.01
+    LOSS_DECREMENT = 0.004
+    BETA1          = 0.9
+    BETA2          = 0.99
+    TAU_FLASH      = 0.001
+
+    client_y = fresh_client_y()
+    gm       = get_model()
+    reset_per_client_metric_state()
+    log      = []
+    csv_out  = LiveCSV(seeded_path('results_FlashColdInit.csv'),
+                       ['round', 'global_acc', 'per_client_gen_acc',
+                        'agg_norm', 'first_mom_norm', 'second_mom_norm',
+                        'delta_mom_norm', 'flash_amp'] + CLIENT_FIELDS)
+    crit     = nn.CrossEntropyLoss()
+
+    first_mom  = 0
+    second_mom = None       # cold-start from first agg^2 (the ONLY change vs Flash)
+    prev_2mom  = None
+    delta_mom  = 0
+    prev_val_loss = {cid: -1 for cid in range(NUM_CLIENTS)}
+
+    try:
+        for rnd in range(NUM_ROUNDS):
+            if rnd in DRIFT_SCHEDULE:
+                apply_drift_event(client_y, DRIFT_SCHEDULE.index(rnd))
+
+            updates, weights = [], []
+            for cid in range(NUM_CLIENTS):
+                lm = get_model()
+                lm.load_state_dict({k: v.clone() for k, v in gm.state_dict().items()})
+                lm.train()
+                init_params = parameters_to_vector(lm.parameters()).detach()
+                opt = optim.SGD(lm.parameters(), lr=LR,
+                                momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
+                x_cid = GPU_CLIENT_X[cid]
+                y_cid = client_y[cid]
+                n     = x_cid.size(0)
+                end   = (n // BATCH_SIZE) * BATCH_SIZE
+
+                for epoch in range(LOCAL_EPOCHS):
+                    perm = torch.randperm(n, device=DEVICE)
+                    for s in range(0, end, BATCH_SIZE):
+                        idx = perm[s:s+BATCH_SIZE]
+                        xb  = gpu_augment(x_cid[idx])
+                        opt.zero_grad()
+                        crit(lm(xb), y_cid[idx]).backward()
+                        opt.step()
+
+                    lm.eval()
+                    val_loss = 0.0
+                    vb       = 0
+                    with torch.no_grad():
+                        for s in range(0, n, 256):
+                            xb_v = gpu_augment(x_cid[s:s+256])
+                            val_loss += crit(lm(xb_v), y_cid[s:s+256]).item()
+                            vb       += 1
+                    val_loss /= max(vb, 1)
+                    if prev_val_loss[cid] != -1:
+                        delta = prev_val_loss[cid] - val_loss
+                        if 0 < delta < LOSS_DECREMENT / (epoch + 1):
+                            break
+                    prev_val_loss[cid] = val_loss
+                    lm.train()
+
+                cur_params = parameters_to_vector(lm.parameters()).detach()
+                updates.append((cur_params - init_params).cpu().numpy())
+                weights.append(CLIENT_WEIGHTS[cid])
+
+            total = sum(weights)
+            agg   = sum(u * (w/total) for u, w in zip(updates, weights))
+            agg2  = np.square(agg)
+
+            first_mom = BETA1 * first_mom + (1 - BETA1) * agg
+
+            # Cold-start init only (this is the control's signature change).
+            if second_mom is None:
+                second_mom = agg2.copy()
+                prev_2mom  = agg2.copy()
+            else:
+                prev_2mom  = second_mom
+                second_mom = BETA2 * second_mom + (1 - BETA2) * agg2
+
+            # Flash's adaptive beta3 + ORIGINAL un-normalized trigger.
+            beta3 = (np.abs(prev_2mom) /
+                     (np.abs(agg2 - second_mom) +
+                      np.abs(prev_2mom) + 1e-10))
+            delta_mom = beta3 * delta_mom + (1 - beta3) * (agg2 - second_mom)
+
+            agg_update = (SERVER_LR * first_mom /
+                          (np.sqrt(second_mom) - delta_mom + TAU_FLASH))
+
+            agg_norm        = float(np.linalg.norm(agg))
+            first_mom_norm  = float(np.linalg.norm(first_mom))
+            second_mom_rms  = float(np.linalg.norm(np.sqrt(np.abs(second_mom))))
+            delta_mom_norm  = float(np.linalg.norm(delta_mom))
+            flash_amp       = delta_mom_norm / (second_mom_rms + TAU_FLASH)
+
+            cur_global = parameters_to_vector(gm.parameters()).detach()
+            new_global = cur_global + torch.tensor(
+                agg_update, dtype=torch.float32).to(DEVICE)
+            vector_to_parameters(new_global, gm.parameters())
+
+            acc        = evaluate_gpu(gm)
+            pc_acc     = evaluate_per_client_gen_acc(gm)
+            local_accs = evaluate_all_clients(gm, client_y)
+            row        = build_local_row(rnd, acc, local_accs,
+                                         extra={'per_client_gen_acc': pc_acc,
+                                                'agg_norm':       agg_norm,
+                                                'first_mom_norm': first_mom_norm,
+                                                'second_mom_norm': second_mom_rms,
+                                                'delta_mom_norm': delta_mom_norm,
+                                                'flash_amp':      flash_amp})
+            log.append(row)
+            csv_out.write(row)
+
+            if rnd % 10 == 0 or rnd in DRIFT_SCHEDULE:
+                tag = "  <-- DRIFT" if rnd in DRIFT_SCHEDULE else ""
+                mean_local = sum(local_accs) / len(local_accs)
+                print(f"  Round {rnd:03d} | Global: {acc:.4f} | "
+                      f"per-client: {pc_acc:.4f} | "
+                      f"mean local: {mean_local:.4f} | "
+                      f"flash_amp={flash_amp:.4f} delta_mom_norm={delta_mom_norm:.5f}"
+                      f"{tag}")
+    finally:
+        csv_out.close()
+    print(f"  Results: {csv_out.path}")
+    return log
+
+
+# ============================================================
+# METHOD 9 — FlashNormTrigger V2 (per-tensor B, fixed warmup window)
+# Heterogeneity-normalized Flash trigger with a FROZEN per-tensor baseline.
+#
+# Rounds 0-WARMUP_START-1: vanilla Adam (delta_mom=0, no firing).
+# Rounds WARMUP_START..WARMUP_END-1: accumulate per-tensor agg^2 mean per round.
+# Round WARMUP_END onwards: B_layer = (1/window) * sum of per-tensor agg^2 means;
+#   frozen. Normalized signal:
+#       ratio[i]        = (agg^2[i] - second_mom[i]) / (B_layer_of_i + eps)
+#       scaled_delta[i] = ratio[i] * second_mom[i]
+#       delta_mom = beta3*delta_mom + (1-beta3)*scaled_delta    # Flash's adaptive beta3
+#       agg_update = server_lr * first_mom / (sqrt(second_mom) - delta_mom + tau)  # IDENTICAL Flash action
+#
+# Per-tensor (one scalar per parameter tensor) rather than per-element B:
+# - Eliminates V1's activation-outlier failure mode (where elements with
+#   B[i]~0 produced ratio explosions). Per-tensor B is dominated by typical
+#   elements and is never near zero in practice.
+# - Mechanistically still captures "heterogeneity baseline at warmup time".
+# ============================================================
+V2_WARMUP_START = 5
+V2_WARMUP_END   = 25
+
+
+def run_flashnorm_v2():
+    print("\n" + "="*60)
+    print("METHOD 9: FlashNormTrigger V2 (per-tensor B, fixed warmup window)")
+    print(f"  warmup rounds {V2_WARMUP_START}..{V2_WARMUP_END-1} (vanilla Adam),")
+    print(f"  B frozen from round {V2_WARMUP_END}, normalized trigger active.")
+    print("="*60)
+
+    SERVER_LR      = 0.01
+    LOSS_DECREMENT = 0.004
+    BETA1          = 0.9
+    BETA2          = 0.99
+    TAU_FLASH      = 0.001
+    EPS_NORM       = 1e-8
+
+    client_y = fresh_client_y()
+    gm       = get_model()
+    reset_per_client_metric_state()
+    log      = []
+    csv_out  = LiveCSV(seeded_path('results_FlashNormV2.csv'),
+                       ['round', 'global_acc', 'per_client_gen_acc',
+                        'agg_norm', 'first_mom_norm', 'second_mom_norm',
+                        'delta_mom_norm', 'flash_amp_new', 'B_layer_norm',
+                        'ratio_norm', 'scaled_delta_norm', 'warmup'] + CLIENT_FIELDS)
+    crit     = nn.CrossEntropyLoss()
+
+    # Layer boundaries in the flattened parameter vector (one B per torch.nn.Parameter).
+    layer_sizes = [int(p.numel()) for p in gm.parameters()]
+    boundaries  = np.cumsum([0] + layer_sizes)
+    num_layers  = len(layer_sizes)
+    print(f"  CifarCNN has {num_layers} parameter tensors, total {boundaries[-1]} params.")
+
+    warmup_layer_sums = np.zeros(num_layers, dtype=np.float64)
+    warmup_count      = 0
+    B_layer_scalars   = None
+    B_layer_expanded  = None  # per-element broadcast of B_layer_scalars
+
+    first_mom    = 0
+    second_mom   = TAU_FLASH ** 2
+    prev_2mom    = 0
+    delta_mom    = 0
+    prev_val_loss = {cid: -1 for cid in range(NUM_CLIENTS)}
+
+    try:
+        for rnd in range(NUM_ROUNDS):
+            if rnd in DRIFT_SCHEDULE:
+                apply_drift_event(client_y, DRIFT_SCHEDULE.index(rnd))
+
+            updates, weights = [], []
+            for cid in range(NUM_CLIENTS):
+                lm = get_model()
+                lm.load_state_dict({k: v.clone() for k, v in gm.state_dict().items()})
+                lm.train()
+                init_params = parameters_to_vector(lm.parameters()).detach()
+                opt = optim.SGD(lm.parameters(), lr=LR,
+                                momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
+                x_cid = GPU_CLIENT_X[cid]
+                y_cid = client_y[cid]
+                n     = x_cid.size(0)
+                end   = (n // BATCH_SIZE) * BATCH_SIZE
+
+                for epoch in range(LOCAL_EPOCHS):
+                    perm = torch.randperm(n, device=DEVICE)
+                    for s in range(0, end, BATCH_SIZE):
+                        idx = perm[s:s+BATCH_SIZE]
+                        xb  = gpu_augment(x_cid[idx])
+                        opt.zero_grad()
+                        crit(lm(xb), y_cid[idx]).backward()
+                        opt.step()
+
+                    lm.eval()
+                    val_loss = 0.0
+                    vb       = 0
+                    with torch.no_grad():
+                        for s in range(0, n, 256):
+                            xb_v = gpu_augment(x_cid[s:s+256])
+                            val_loss += crit(lm(xb_v), y_cid[s:s+256]).item()
+                            vb       += 1
+                    val_loss /= max(vb, 1)
+                    if prev_val_loss[cid] != -1:
+                        delta = prev_val_loss[cid] - val_loss
+                        if 0 < delta < LOSS_DECREMENT / (epoch + 1):
+                            break
+                    prev_val_loss[cid] = val_loss
+                    lm.train()
+
+                cur_params = parameters_to_vector(lm.parameters()).detach()
+                updates.append((cur_params - init_params).cpu().numpy())
+                weights.append(CLIENT_WEIGHTS[cid])
+
+            total = sum(weights)
+            agg   = sum(u * (w/total) for u, w in zip(updates, weights))
+            agg2  = np.square(agg)
+
+            first_mom = BETA1 * first_mom + (1 - BETA1) * agg
+            prev_2mom = second_mom
+            second_mom = BETA2 * second_mom + (1 - BETA2) * agg2
+
+            in_warmup = rnd < V2_WARMUP_END
+
+            # Accumulate per-tensor agg^2 means during the warmup-collection window.
+            if V2_WARMUP_START <= rnd < V2_WARMUP_END:
+                for L in range(num_layers):
+                    warmup_layer_sums[L] += float(np.mean(agg2[boundaries[L]:boundaries[L+1]]))
+                warmup_count += 1
+                if rnd == V2_WARMUP_END - 1:
+                    B_layer_scalars = warmup_layer_sums / warmup_count
+                    B_layer_expanded = np.empty(boundaries[-1], dtype=np.float64)
+                    for L in range(num_layers):
+                        B_layer_expanded[boundaries[L]:boundaries[L+1]] = B_layer_scalars[L]
+                    print(f"  [V2] B frozen at rd {rnd}: per-layer B = {B_layer_scalars}")
+
+            if in_warmup:
+                # Vanilla Adam: delta_mom stays at 0; action reduces to Adam.
+                delta_mom = 0
+                ratio_norm_val = 0.0
+                scaled_delta_norm_val = 0.0
+            else:
+                # Normalized trigger, frozen per-tensor baseline.
+                ratio = (agg2 - second_mom) / (B_layer_expanded + EPS_NORM)
+                scaled_delta = ratio * second_mom
+                beta3 = (np.abs(prev_2mom) /
+                         (np.abs(agg2 - second_mom) +
+                          np.abs(prev_2mom) + 1e-10))
+                delta_mom = beta3 * delta_mom + (1 - beta3) * scaled_delta
+                ratio_norm_val = float(np.linalg.norm(ratio))
+                scaled_delta_norm_val = float(np.linalg.norm(scaled_delta))
+
+            agg_update = (SERVER_LR * first_mom /
+                          (np.sqrt(second_mom) - delta_mom + TAU_FLASH))
+
+            agg_norm        = float(np.linalg.norm(agg))
+            first_mom_norm  = float(np.linalg.norm(first_mom))
+            second_mom_rms  = float(np.linalg.norm(np.sqrt(np.abs(second_mom))))
+            delta_mom_norm  = float(np.linalg.norm(delta_mom)) if not in_warmup else 0.0
+            flash_amp_new   = delta_mom_norm / (second_mom_rms + TAU_FLASH)
+            B_layer_norm    = float(np.linalg.norm(B_layer_expanded)) if B_layer_expanded is not None else 0.0
+
+            cur_global = parameters_to_vector(gm.parameters()).detach()
+            new_global = cur_global + torch.tensor(
+                agg_update, dtype=torch.float32).to(DEVICE)
+            vector_to_parameters(new_global, gm.parameters())
+
+            acc        = evaluate_gpu(gm)
+            pc_acc     = evaluate_per_client_gen_acc(gm)
+            local_accs = evaluate_all_clients(gm, client_y)
+            row        = build_local_row(rnd, acc, local_accs,
+                                         extra={'per_client_gen_acc': pc_acc,
+                                                'agg_norm':       agg_norm,
+                                                'first_mom_norm': first_mom_norm,
+                                                'second_mom_norm': second_mom_rms,
+                                                'delta_mom_norm': delta_mom_norm,
+                                                'flash_amp_new':  flash_amp_new,
+                                                'B_layer_norm':   B_layer_norm,
+                                                'ratio_norm':     ratio_norm_val,
+                                                'scaled_delta_norm': scaled_delta_norm_val,
+                                                'warmup':         int(in_warmup)})
+            log.append(row)
+            csv_out.write(row)
+
+            if rnd % 10 == 0 or rnd in DRIFT_SCHEDULE or rnd == V2_WARMUP_END:
+                tag_pieces = []
+                if rnd in DRIFT_SCHEDULE: tag_pieces.append("DRIFT")
+                if in_warmup:             tag_pieces.append("WARMUP")
+                if rnd == V2_WARMUP_END:  tag_pieces.append("B-FROZEN")
+                tag = "  <-- " + ", ".join(tag_pieces) if tag_pieces else ""
+                mean_local = sum(local_accs) / len(local_accs)
+                print(f"  Round {rnd:03d} | Global: {acc:.4f} | "
+                      f"per-client: {pc_acc:.4f} | "
+                      f"mean local: {mean_local:.4f} | "
+                      f"amp_new={flash_amp_new:.4f} ratio={ratio_norm_val:.4f}"
+                      f"{tag}")
+    finally:
+        csv_out.close()
+    print(f"  Results: {csv_out.path}")
+    return log
+
+
+# ============================================================
 # METHOD 3 — AdaptiveFedAvg (ported from FedCCFA)
 # Server tracks EMA of global-param mean/variance to compute a
 # bias-corrected variance ratio that scales the client LR each round.
@@ -1614,12 +2177,15 @@ def run_cda_fedavg():
 # ============================================================
 
 METHOD_REGISTRY = {
-    1: ('FedAvg',          run_fedavg),
-    2: ('Flash',           run_flash),
-    3: ('AdaptiveFedAvg',  run_adaptive_fedavg),
-    4: ('OurMethod',       run_our_method),
-    5: ('FedAvgPlus1',     run_fedavg_plus1),   # control: FedAvg + 1 local epoch for per-client eval only
-    6: ('Saile',           run_saile),          # Saile 2024 (FLTA): per-client loss-EMA dynamic LR
+    1: ('FedAvg',            run_fedavg),
+    2: ('Flash',             run_flash),
+    3: ('AdaptiveFedAvg',    run_adaptive_fedavg),
+    4: ('OurMethod',         run_our_method),
+    5: ('FedAvgPlus1',       run_fedavg_plus1),   # control: FedAvg + 1 local epoch for per-client eval only
+    6: ('Saile',             run_saile),          # Saile 2024 (FLTA): per-client loss-EMA dynamic LR
+    7: ('FlashNormTrigger',  run_flashnorm),      # V1: heterogeneity-normalized Flash trigger (server-side)
+    8: ('FlashColdInit',     run_flashcoldinit),  # attribution control: Flash + cold-start init only
+    9: ('FlashNormV2',       run_flashnorm_v2),   # V2: per-tensor B, fixed warmup window, normalized trigger from round 25
 }
 
 
@@ -1634,13 +2200,16 @@ def parse_args():
                 "  4  OurMethod\n"
                 "  5  FedAvgPlus1 (control: FedAvg + 1 local epoch for per-client eval only)\n"
                 "  6  Saile (2024 FLTA: per-client loss-EMA dynamic LR)\n"
+                "  7  FlashNormTrigger (V1: heterogeneity-normalized Flash trigger; server-side)\n"
+                "  8  FlashColdInit (attribution control: Flash + cold-start init only)\n"
+                "  9  FlashNormV2 (per-tensor B, fixed warmup window, normalized trigger)\n"
                 "\nExamples:\n"
                 "  python3 all_experiments_optimized.py\n"
                 "  python3 all_experiments_optimized.py --methods 1\n"
                 "  python3 all_experiments_optimized.py --methods 1 2 4\n"
                 "  python3 all_experiments_optimized.py --methods all\n"))
     p.add_argument('--methods', nargs='+', default=['all'],
-                   help="Method IDs (1..6) or 'all' (default; methods 1..6 only).")
+                   help="Method IDs (1..7) or 'all' (default; methods 1..6 only).")
     p.add_argument('--rounds', type=int, default=None,
                    help=f"Override total rounds (default {NUM_ROUNDS}). "
                         f"For smoke tests, use a small value like 10.")
@@ -1707,6 +2276,12 @@ def parse_args():
                         "E.g. --partial-cohorts A means only cohort A (6 of 20 "
                         "clients) drifts at scheduled rounds; B and C stay clean. "
                         "Valid cohorts: A, B, C.")
+    p.add_argument('--flashnorm-beta-b', type=float, default=None,
+                   help=f"Override the slow heterogeneity-baseline EMA rate for "
+                        f"FlashNormTrigger (method 7). Default {FLASHNORM_BETA_B}. "
+                        f"Smaller => faster baseline (risks absorbing real drift). "
+                        f"Larger => slower baseline (risks staleness). Use for the "
+                        f"beta_b sensitivity ablation.")
     return p.parse_args()
 
 
@@ -1719,9 +2294,9 @@ def resolve_methods(arg_list):
             n = int(a)
         except ValueError:
             raise SystemExit(f"Unknown --methods value: {a!r}. "
-                             f"Use 1..6 or 'all'.")
+                             f"Use 1..7 or 'all'.")
         if n not in METHOD_REGISTRY:
-            raise SystemExit(f"Unknown method id: {n}. Valid: 1..6")
+            raise SystemExit(f"Unknown method id: {n}. Valid: {sorted(METHOD_REGISTRY)}")
         if n not in out:
             out.append(n)
     return out
@@ -1866,6 +2441,10 @@ if __name__ == '__main__':
     if args.saile_init_lr is not None:
         SAILE_INIT_LR = args.saile_init_lr
         print(f"[--saile-init-lr] SAILE_INIT_LR = {SAILE_INIT_LR}")
+
+    if args.flashnorm_beta_b is not None:
+        FLASHNORM_BETA_B = args.flashnorm_beta_b
+        print(f"[--flashnorm-beta-b] FLASHNORM_BETA_B = {FLASHNORM_BETA_B}")
 
     if args.out_dir is not None:
         OUT_DIR = args.out_dir
