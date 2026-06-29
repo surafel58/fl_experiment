@@ -1,0 +1,8 @@
+[gate] start at Wed Jun 24 09:00:46 UTC 2026
+[gate] launching: tag=dir05  (--alpha-dir 0.5)  +  tag=recurrent  (--alternating-drift)
+[gate] PIDs: 1385 1390 
+[gate] pair done at Wed Jun 24 09:38:54 UTC 2026
+[gate] launching: tag=aggressive  (--aggressive-concept-drift)  +  tag=covariate  (--covariate-drift)
+[gate] PIDs: 2368 2376 
+[gate] pair done at Wed Jun 24 09:39:30 UTC 2026
+[gate] ALL DONE at Wed Jun 24 09:39:30 UTC 2026
